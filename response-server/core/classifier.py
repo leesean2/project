@@ -12,6 +12,7 @@ On AI timeout/error, automatically falls back.
 import json
 import logging
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -82,6 +83,36 @@ PROD_NAMESPACE_PATTERNS = {"prod", "production", "live", "stable"}
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 
+# ─── AI 엔드포인트 보안 상수 ──────────────────────────────────
+# [SSRF 방지] 허용 URL 스킴: file://, ftp:// 등 비HTTP 스킴 차단
+_ALLOWED_AI_SCHEMES = frozenset({"https", "http"})
+# [메모리 소진 방지] AI 응답 최대 허용 크기 (1 MB)
+_MAX_AI_RESPONSE_BYTES = 1 * 1024 * 1024
+
+
+def _validate_ai_endpoint(url: str) -> None:
+    """
+    AI 엔드포인트 URL 유효성 검증 — SSRF 공격 방지.
+
+    file://, ftp:// 등 비HTTP 스킴을 통한 내부 파일 읽기/내부망 스캔을 차단.
+    빈 host나 비정상 URL 구조도 거부.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as exc:
+        raise ValueError(f"AI_ENDPOINT URL 파싱 실패: {exc}") from exc
+
+    if parsed.scheme not in _ALLOWED_AI_SCHEMES:
+        raise ValueError(
+            f"AI_ENDPOINT 스킴 '{parsed.scheme}' 은 허용되지 않습니다. "
+            "http 또는 https 만 사용하세요."
+        )
+    if not parsed.netloc:
+        raise ValueError(
+            "AI_ENDPOINT 에 유효한 호스트가 없습니다. "
+            "예: http://ai-module.svc/classify"
+        )
+
 
 def _max_severity(a: str, b: str) -> str:
     return a if SEVERITY_ORDER.get(a, 0) >= SEVERITY_ORDER.get(b, 0) else b
@@ -113,6 +144,9 @@ class ThreatClassifier:
         ai_confidence_threshold: float = DEFAULT_AI_CONFIDENCE_THRESHOLD,
         fallback_confidence_threshold: float = DEFAULT_FALLBACK_CONFIDENCE_THRESHOLD,
     ):
+        # [SSRF 방지] 서버 시작 시 엔드포인트 URL 검증 — 잘못된 설정은 즉시 실패
+        if ai_endpoint:
+            _validate_ai_endpoint(ai_endpoint)
         self.ai_endpoint = ai_endpoint
         self.ai_timeout = ai_timeout
         self.metrics = metrics
@@ -173,7 +207,19 @@ class ThreatClassifier:
                 if self.metrics:
                     self.metrics.observe_ai_latency(duration)
 
-                result = json.loads(resp.read().decode("utf-8"))
+                # [메모리 소진 방지] 역직렬화 전 응답 크기를 n+1 바이트 읽어
+                # _MAX_AI_RESPONSE_BYTES 초과 여부를 확인하고 초과 시 즉시 폐기.
+                raw_bytes = resp.read(_MAX_AI_RESPONSE_BYTES + 1)
+                if len(raw_bytes) > _MAX_AI_RESPONSE_BYTES:
+                    logger.warning(
+                        "AI 응답이 최대 허용 크기(%d bytes)를 초과하여 폐기합니다",
+                        _MAX_AI_RESPONSE_BYTES,
+                    )
+                    if self.metrics:
+                        self.metrics.inc_ai(error=True, fallback=True)
+                        self.metrics.observe_ai_latency(duration)
+                    return None
+                result = json.loads(raw_bytes.decode("utf-8"))
 
                 # [MEDIUM #4] AI 응답 검증 — severity는 허용 목록만 수용
                 raw_severity = result.get("severity", "medium")

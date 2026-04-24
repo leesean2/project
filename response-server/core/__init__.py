@@ -9,6 +9,7 @@ Stores the last N response records for:
 
 import threading
 import time
+import uuid
 from collections import deque
 from typing import List, Optional
 
@@ -21,13 +22,12 @@ class EventStore:
     def __init__(self, max_size: int = 1000):
         self._lock = threading.Lock()
         self._events: deque = deque(maxlen=max_size)
-        self._id_counter = 0
 
     def add(self, record: ResponseRecord) -> str:
         """Add a record and return its assigned ID."""
         with self._lock:
-            self._id_counter += 1
-            record.id = f"evt-{self._id_counter:06d}"
+            # [열거 공격 방지] 순차 ID 대신 UUID — 예측 불가 식별자 사용
+            record.id = f"evt-{uuid.uuid4().hex}"
             self._events.append(record)
             return record.id
 
@@ -119,5 +119,4 @@ class EventStore:
         with self._lock:
             count = len(self._events)
             self._events.clear()
-            self._id_counter = 0
             return count

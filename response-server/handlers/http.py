@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -55,6 +56,45 @@ _ALLOWED_ORIGINS: list[str] = [
 # GET /api/v1/events?limit 최대 허용값
 _MAX_EVENT_LIMIT: int = 500
 
+# ─── 공개 읽기 API 속도 제한 (토큰 버킷, IP당) ──────────────────
+# burst: 최대 순간 요청 수, refill: 초당 충전 속도
+_READ_RL_BURST: int = int(os.environ.get("READ_RATE_LIMIT_BURST", "30"))
+_READ_RL_REFILL: float = float(os.environ.get("READ_RATE_LIMIT_REFILL", "1.0"))
+
+
+class _ReadRateLimiter:
+    """IP당 토큰 버킷 속도 제한기 (공개 GET API 전용)."""
+
+    def __init__(self, capacity: int, refill_rate: float):
+        self._capacity = float(capacity)
+        self._refill = refill_rate
+        self._buckets: dict = {}
+        self._lock = threading.Lock()
+
+    def is_allowed(self, ip: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            tokens, last = self._buckets.get(ip, (self._capacity, now))
+            tokens = min(self._capacity, tokens + (now - last) * self._refill)
+            if tokens >= 1.0:
+                self._buckets[ip] = (tokens - 1.0, now)
+                return True
+            self._buckets[ip] = (tokens, now)
+            return False
+
+
+_read_rate_limiter = _ReadRateLimiter(_READ_RL_BURST, _READ_RL_REFILL)
+
+
+def _mask_ip(ip: str) -> str:
+    """로그 프라이버시 보호 — IPv4 마지막 옥텟, IPv6 뒷부분을 마스킹."""
+    if not ip:
+        return "unknown"
+    parts = ip.split(".")
+    if len(parts) == 4:
+        return f"{parts[0]}.{parts[1]}.{parts[2]}.***"
+    return ip[:8] + "***"
+
 
 def _constant_time_eq(a: str, b: str) -> bool:
     """타이밍 공격 방지를 위한 상수 시간 문자열 비교."""
@@ -75,6 +115,19 @@ class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         """Suppress default access log (we use structured logging)."""
         pass
+
+    def _client_ip(self) -> str:
+        """로그용 마스킹된 클라이언트 IP 반환."""
+        return _mask_ip(self.client_address[0] if self.client_address else "")
+
+    def _check_read_rate(self) -> bool:
+        """공개 읽기 API 속도 제한 검사. 초과 시 429 응답 후 False 반환."""
+        ip = self.client_address[0] if self.client_address else ""
+        if not _read_rate_limiter.is_allowed(ip):
+            logger.warning("Read rate limit exceeded: ip=%s", _mask_ip(ip))
+            self._send_json(429, {"error": "too many requests"})
+            return False
+        return True
 
     # ─── Routing ──────────────────────────────────────────
 
@@ -151,7 +204,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not auth_header.startswith("Bearer "):
             logger.warning(
                 "API auth failed: missing Bearer token from %s",
-                self.client_address[0] if self.client_address else "unknown",
+                self._client_ip(),
             )
             self._send_json(401, {"error": "unauthorized: Bearer token required"})
             return False
@@ -160,7 +213,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not _constant_time_eq(provided_token, _API_TOKEN):
             logger.warning(
                 "API auth failed: invalid token from %s",
-                self.client_address[0] if self.client_address else "unknown",
+                self._client_ip(),
             )
             self._send_json(401, {"error": "unauthorized: invalid token"})
             return False
@@ -186,7 +239,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not provided:
             logger.warning(
                 "Heartbeat auth failed: missing X-Watchdog-Token from %s",
-                self.client_address[0] if self.client_address else "unknown",
+                self._client_ip(),
             )
             self._send_json(401, {"error": "unauthorized: X-Watchdog-Token required"})
             return False
@@ -194,7 +247,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if not _constant_time_eq(provided, _HEARTBEAT_TOKEN):
             logger.warning(
                 "Heartbeat auth failed: invalid token from %s",
-                self.client_address[0] if self.client_address else "unknown",
+                self._client_ip(),
             )
             self._send_json(401, {"error": "unauthorized: invalid heartbeat token"})
             return False
@@ -286,6 +339,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         [MEDIUM #7] limit 파라미터 최대값 _MAX_EVENT_LIMIT(500)으로 제한.
         음수 또는 비정수 값은 기본값(50)으로 대체.
         """
+        if not self._check_read_rate():
+            return
         params = parse_qs(urlparse(self.path).query)
         store = self.server.store
 
@@ -315,11 +370,15 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _handle_event_summary(self):
         """GET /api/v1/events/summary — dashboard aggregation."""
+        if not self._check_read_rate():
+            return
         summary = self.server.store.get_summary()
         self._send_json(200, summary)
 
     def _handle_get_event(self, event_id: str):
         """GET /api/v1/events/:id"""
+        if not self._check_read_rate():
+            return
         event = self.server.store.get_by_id(event_id)
         if event:
             self._send_json(200, event)
@@ -332,6 +391,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         """
         GET /api/v1/isolations?namespace=test-workloads
         """
+        if not self._check_read_rate():
+            return
         params = parse_qs(urlparse(self.path).query)
         namespace = params.get("namespace", [""])[0]
         policies = self.server.kube.list_isolation_policies(namespace)
@@ -350,7 +411,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             logger.info(
                 "Isolation deleted by API: %s/%s from %s",
                 namespace, policy_name,
-                self.client_address[0] if self.client_address else "unknown",
+                self._client_ip(),
             )
             self._send_json(200, {
                 "status": "deleted",
@@ -433,6 +494,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
 
+        # [보안 헤더] 클릭재킹·MIME 스니핑·캐시 노출 방지
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cache-Control", "no-store")
+
         # [HIGH #6] CORS 화이트리스트 처리
         request_origin = self.headers.get("Origin", "")
         if request_origin in _ALLOWED_ORIGINS:
@@ -454,5 +520,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # [보안 헤더] 클릭재킹·MIME 스니핑 방지
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(body)
