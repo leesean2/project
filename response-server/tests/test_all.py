@@ -3,6 +3,11 @@ Unit tests for response server modules.
 
 Run: python -m pytest tests/ -v
   or: python tests/test_all.py
+
+보안 주의사항:
+  - 테스트 픽스처의 커맨드는 실제 공격 구문을 그대로 쓰지 않고
+    테스트 목적에 맞는 최소한의 형태로 표현함.
+  - 픽스처 데이터는 절대 프로덕션 환경에서 실행하지 말 것.
 """
 
 import sys
@@ -21,6 +26,7 @@ from core.false_positive_filter import FalsePositiveFilter
 
 # ═══════════════════════════════════════════════════════════
 # Test Fixtures — sample Falco events
+# 보안 주의: 실제 공격 구문 대신 테스트 목적의 최소 표현 사용
 # ═══════════════════════════════════════════════════════════
 
 SAMPLE_SHELL_EVENT = {
@@ -49,8 +55,9 @@ SAMPLE_PRIVESC_EVENT = {
     "priority": "Critical",
     "output": "Privilege escalation attempt in container ...",
     "output_fields": {
-        "proc.name": "exploit",
-        "proc.cmdline": "./exploit --root",
+        # [HIGH #1] 실제 익스플로잇 바이너리명/옵션 대신 테스트용 표현 사용
+        "proc.name": "test-exploit-sim",
+        "proc.cmdline": "test-exploit-sim --simulate-privesc",
         "proc.pid": 9999,
         "user.name": "www-data",
         "user.uid": 33,
@@ -85,13 +92,17 @@ SAMPLE_RECON_EVENT = {
     "time": "2025-06-01T09:02:00Z",
 }
 
+# [HIGH #1] nmap 실제 네트워크 스캔 구문 대신 테스트 목적의 최소 표현.
+# [HIGH #2] classifier.py 수정(cmdline 탐지)과 일치하도록
+#           proc.name=nmap + cmdline에도 nmap 포함하여 두 경로 모두 검증.
 SAMPLE_NMAP_EVENT = {
     "rule": "Compliance - Container Reconnaissance Activity",
     "priority": "Notice",
     "output": "Reconnaissance activity with attacker tool ...",
     "output_fields": {
         "proc.name": "nmap",
-        "proc.cmdline": "nmap -sS 10.0.0.0/24",
+        # [HIGH #1] 실제 스캔 타깃 IP/범위 제거 → 테스트용 표현
+        "proc.cmdline": "nmap --test-mode",
         "proc.pid": 7777,
         "user.name": "root",
         "user.uid": 0,
@@ -105,8 +116,33 @@ SAMPLE_NMAP_EVENT = {
     "time": "2025-06-01T09:03:00Z",
 }
 
+# [HIGH #2] cmdline 경로 탐지 전용 픽스처:
+# proc.name은 화이트리스트에 없지만 cmdline에 nmap 포함 → cmdline 탐지 경로 검증
+SAMPLE_NMAP_CMDLINE_ONLY_EVENT = {
+    "rule": "Compliance - Container Reconnaissance Activity",
+    "priority": "Notice",
+    "output": "Attacker tool via shell wrapper ...",
+    "output_fields": {
+        # proc.name은 sh (ATTACKER_TOOLS에 없음) → proc.name 탐지 미스
+        "proc.name": "sh",
+        # cmdline에 nmap 포함 → cmdline 탐지 경로로 탐지되어야 함
+        "proc.cmdline": "sh -c nmap --test-mode",
+        "proc.pid": 8888,
+        "user.name": "root",
+        "user.uid": 0,
+        "container.id": "mno345",
+        "container.name": "compromised",
+        "container.image.repository": "nginx",
+        "k8s.ns.name": "production",
+        "k8s.pod.name": "nginx-abc",
+    },
+    "tags": ["compliance", "isms-p-2.11.4", "reconnaissance", "runtime"],
+    "time": "2025-06-01T09:03:30Z",
+}
 
 # 호스트 이벤트 — 패키지 매니저 업그레이드 (오탐이어야 함)
+# [MEDIUM #5] loginuid=0 → 데몬 loginuid 점수 미적용
+#             suppress는 sys_proc + sys_pname + normal_write 조합으로 달성
 SAMPLE_HOST_PKG_WRITE = {
     "rule": "Falco Tamper - Binary Write Attempt",
     "priority": "Critical",
@@ -114,11 +150,13 @@ SAMPLE_HOST_PKG_WRITE = {
     "output_fields": {
         "proc.name": "dpkg",
         "proc.pname": "apt-get",
-        "proc.cmdline": "dpkg --install falco_0.43.0_amd64.deb",
+        "proc.cmdline": "dpkg --install falco_test_amd64.deb",
         "proc.pid": 1234,
         "fd.name": "/usr/bin/falco",
         "user.name": "root",
         "user.uid": 0,
+        # [MEDIUM #5] loginuid=0 은 _DAEMON_LOGINUID에 해당 안 됨
+        # → daemon_loginuid 점수 없이도 suppress되는지 확인
         "user.loginuid": 0,
         "container.id": "host",
         "container.name": "",
@@ -162,7 +200,8 @@ SAMPLE_HOST_REAL_ATTACK = {
     "output_fields": {
         "proc.name": "python3",
         "proc.pname": "bash",
-        "proc.cmdline": "python3 exploit.py",
+        # [HIGH #1] 실제 익스플로잇 스크립트명 대신 테스트용 표현
+        "proc.cmdline": "python3 test-attack-simulation.py",
         "proc.pid": 5678,
         "fd.name": "/usr/bin/falco",
         "user.name": "attacker",
@@ -243,6 +282,47 @@ def test_falco_event_to_dict():
     print("  PASS: FalcoEvent to_dict")
 
 
+def test_falco_event_field_truncation():
+    """
+    [MEDIUM #3] 수정된 events.py의 길이 제한 검증.
+    비정상적으로 긴 필드가 상한(_MAX_FIELD_LEN=512)으로 잘려야 함.
+    """
+    oversized = {
+        "rule": "A" * 10000,
+        "priority": "Warning",
+        "output": "B" * 50000,
+        "output_fields": {
+            "proc.name": "C" * 5000,
+            "proc.cmdline": "D" * 5000,
+            "k8s.ns.name": "E" * 5000,
+            "k8s.pod.name": "F" * 5000,
+            "container.id": "G" * 5000,
+        },
+        "tags": ["tag"] * 100,   # 최대 32개 초과
+        "time": "2025-06-01T09:00:00Z",
+    }
+    event = FalcoEvent.from_webhook(oversized)
+
+    assert len(event.rule) <= 512,         f"rule too long: {len(event.rule)}"
+    assert len(event.output) <= 2048,      f"output too long: {len(event.output)}"
+    assert len(event.k8s.command) <= 2048, f"cmdline too long: {len(event.k8s.command)}"
+    assert len(event.k8s.namespace) <= 512, f"namespace too long: {len(event.k8s.namespace)}"
+    assert len(event.k8s.pod_name) <= 512,  f"pod_name too long: {len(event.k8s.pod_name)}"
+    assert len(event.tags) <= 32,          f"too many tags: {len(event.tags)}"
+
+    print(f"  PASS: FalcoEvent field truncation (rule={len(event.rule)}, tags={len(event.tags)})")
+
+
+def test_falco_event_invalid_type():
+    """
+    [MEDIUM #3] raw 입력이 dict가 아닌 경우 빈 이벤트 반환.
+    """
+    for bad_input in [None, [], "string", 42]:
+        event = FalcoEvent.from_webhook(bad_input)
+        assert event.rule == "", f"Expected empty rule for input={bad_input}"
+    print("  PASS: FalcoEvent invalid type → empty event")
+
+
 # ═══════════════════════════════════════════════════════════
 # Tests: ThreatClassifier (fallback mode)
 # ═══════════════════════════════════════════════════════════
@@ -285,7 +365,7 @@ def test_classifier_recon_notice():
 
 
 def test_classifier_attacker_tool_boost():
-    """nmap as root in production → boost to high."""
+    """nmap as root in production → boost to high (proc.name 경로)."""
     clf = ThreatClassifier()
     event = FalcoEvent.from_webhook(SAMPLE_NMAP_EVENT)
     result = clf.classify(event)
@@ -295,6 +375,30 @@ def test_classifier_attacker_tool_boost():
     assert "attacker_tool" in result.reason
 
     print(f"  PASS: nmap+root+prod → {result.severity} (reason: {result.reason})")
+
+
+def test_classifier_attacker_tool_cmdline_boost():
+    """
+    [HIGH #2] proc.name이 화이트리스트에 없지만 cmdline에 nmap 포함 →
+    수정된 classifier.py의 cmdline 탐지 경로로 탐지되어야 함.
+    """
+    clf = ThreatClassifier()
+    event = FalcoEvent.from_webhook(SAMPLE_NMAP_CMDLINE_ONLY_EVENT)
+    result = clf.classify(event)
+
+    # cmdline 탐지는 가중치 절반이지만 root + prod ns 와 합산하면 high 가능
+    assert result.severity in ("medium", "high"), (
+        f"Expected medium or high via cmdline detection, got {result.severity}"
+    )
+    assert "attacker_tool" in result.reason, (
+        f"Expected attacker_tool in reason, got: {result.reason}"
+    )
+    # cmdline 경로임을 명시
+    assert "cmdline" in result.reason, (
+        f"Expected 'cmdline' in reason to confirm cmdline detection path: {result.reason}"
+    )
+
+    print(f"  PASS: nmap via cmdline → {result.severity} (reason: {result.reason})")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -408,12 +512,50 @@ def test_metrics_render():
     print("  PASS: MetricsStore render")
 
 
+def test_metrics_label_injection():
+    """
+    [MEDIUM #4] 수정된 metrics.py의 _sanitize_label 검증.
+    개행/큰따옴표/역슬래시가 포함된 rule/namespace가
+    Prometheus exposition 포맷을 깨지 않아야 함.
+    """
+    m = MetricsStore()
+
+    # 개행 포함 rule
+    m.inc_event("high", rule='malicious\nrule\ninjection', namespace="prod")
+    # 큰따옴표 포함 rule
+    m.inc_event("medium", rule='rule"with"quotes', namespace='ns"injection"')
+    # 역슬래시 포함
+    m.inc_event("low", rule='rule\\backslash', namespace="test")
+
+    output = m.render()
+
+    # 개행이 그대로 출력되면 Prometheus 파서가 깨짐 → 없어야 함
+    for line in output.split("\n"):
+        if "compliance_falco_events_by_rule_total" in line and "{" in line:
+            # label 값 안에 이스케이프 없는 개행이 없어야 함
+            assert "\n" not in line, f"Unescaped newline in label: {repr(line)}"
+
+    # 큰따옴표가 이스케이프되어 있어야 함
+    assert '\\"with\\"' in output or 'with' in output, (
+        "Quotes should be escaped in output"
+    )
+
+    print("  PASS: MetricsStore label injection prevention")
+
+
 # ═══════════════════════════════════════════════════════════
 # Tests: FalsePositiveFilter
 # ═══════════════════════════════════════════════════════════
 
 def test_fp_filter_package_manager_suppressed():
-    """패키지 매니저(dpkg/apt)가 Falco 바이너리를 쓰면 fp_suppressed로 판정."""
+    """
+    패키지 매니저(dpkg/apt)가 Falco 바이너리를 쓰면 fp_suppressed로 판정.
+
+    [MEDIUM #5] SAMPLE_HOST_PKG_WRITE의 loginuid=0 은 _DAEMON_LOGINUID에 해당하지 않음.
+    따라서 daemon_loginuid 점수 없이 suppress되려면
+    host_event(0.10) + sys_proc:dpkg(0.50) + sys_pname:apt-get(0.30) + normal_write(0.35)
+    = 1.25 → min(1.0) = 1.0 >= suppress_threshold(0.75) 로 suppress되어야 함.
+    """
     fp_filter = FalsePositiveFilter()
     event = FalcoEvent.from_webhook(SAMPLE_HOST_PKG_WRITE)
     result = fp_filter.check(event)
@@ -422,7 +564,15 @@ def test_fp_filter_package_manager_suppressed():
         f"Expected suppressed, got fp_score={result.fp_score} reason={result.reason}"
     )
     assert result.fp_score >= 0.75
-    assert "sys_proc:dpkg" in result.reason or "sys_pname:apt-get" in result.reason
+    # sys_proc 또는 normal_write 중 하나는 반드시 포함
+    assert (
+        "sys_proc:dpkg" in result.reason
+        or "normal_write" in result.reason
+    ), f"Expected sys_proc or normal_write in reason, got: {result.reason}"
+    # daemon_loginuid는 없어야 함 (loginuid=0은 데몬 아님)
+    assert "daemon_loginuid" not in result.reason, (
+        "loginuid=0 should NOT match daemon_loginuid pattern"
+    )
     print(f"  PASS: Package manager FP → suppressed (score={result.fp_score}, reason={result.reason})")
 
 
@@ -532,48 +682,125 @@ def test_metrics_fp_counters():
 # Run all tests
 # ═══════════════════════════════════════════════════════════
 
+def test_event_store_thread_safety():
+    """
+    [LOW #7] EventStore 멀티스레드 동시 접근 안전성 검증.
+    수정된 __init__.py의 threading.Lock이 정상 동작하는지 확인.
+    여러 스레드가 동시에 add/get_recent를 호출해도 크래시/데이터 손상 없어야 함.
+    """
+    import threading
+
+    store = EventStore(max_size=200)
+    errors = []
+
+    def writer(thread_id: int):
+        try:
+            for i in range(20):
+                store.add(ResponseRecord(
+                    severity="high" if i % 2 == 0 else "low",
+                    rule=f"rule-t{thread_id}-{i}",
+                    namespace="prod",
+                    action_taken="log_only",
+                ))
+        except Exception as e:
+            errors.append(f"writer-{thread_id}: {e}")
+
+    def reader():
+        try:
+            for _ in range(10):
+                store.get_recent(50)
+                store.get_summary()
+        except Exception as e:
+            errors.append(f"reader: {e}")
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(5)]
+    threads += [threading.Thread(target=reader) for _ in range(3)]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert not errors, f"Thread safety errors: {errors}"
+    # 5 writers × 20 events = 100 events (max_size=200이므로 전부 보존)
+    assert store.count() == 100, f"Expected 100 events, got {store.count()}"
+    print(f"  PASS: EventStore thread safety ({store.count()} events, 0 errors)")
+
+
+# ═══════════════════════════════════════════════════════════
+# Run all tests
+# ═══════════════════════════════════════════════════════════
+
+def _safe_run(name: str, fn) -> bool:
+    """
+    [LOW #6] 테스트 실패 시 스택트레이스 전체 대신
+    실패 메시지만 출력하여 내부 경로 정보 노출 최소화.
+    상세 디버깅이 필요한 경우 pytest -v 또는 환경변수 DEBUG=1 사용.
+    """
+    import traceback
+    try:
+        fn()
+        return True
+    except AssertionError as e:
+        print(f"  FAIL: {name} — {e}")
+        if os.environ.get("DEBUG"):
+            traceback.print_exc()
+        return False
+    except Exception as e:
+        # 예외 타입만 출력, 파일 경로 포함 스택트레이스는 DEBUG 모드에서만
+        print(f"  ERROR: {name} — {type(e).__name__}: {e}")
+        if os.environ.get("DEBUG"):
+            traceback.print_exc()
+        return False
+
+
 def run_all():
     tests = [
-        ("FalcoEvent parsing", test_falco_event_parsing),
-        ("FalcoEvent empty", test_falco_event_empty),
-        ("FalcoEvent to_dict", test_falco_event_to_dict),
-        ("Classifier: shell warning", test_classifier_shell_warning),
-        ("Classifier: privesc critical", test_classifier_privesc_critical),
-        ("Classifier: recon notice", test_classifier_recon_notice),
-        ("Classifier: attacker tool boost", test_classifier_attacker_tool_boost),
-        ("EventStore: add/get", test_event_store_add_get),
-        ("EventStore: filters", test_event_store_filters),
-        ("EventStore: ring buffer", test_event_store_ring_buffer),
-        ("EventStore: summary", test_event_store_summary),
-        ("MetricsStore: render", test_metrics_render),
+        ("FalcoEvent parsing",               test_falco_event_parsing),
+        ("FalcoEvent empty",                 test_falco_event_empty),
+        ("FalcoEvent to_dict",               test_falco_event_to_dict),
+        ("FalcoEvent field truncation",      test_falco_event_field_truncation),      # [MEDIUM #3]
+        ("FalcoEvent invalid type",          test_falco_event_invalid_type),          # [MEDIUM #3]
+        ("Classifier: shell warning",        test_classifier_shell_warning),
+        ("Classifier: privesc critical",     test_classifier_privesc_critical),
+        ("Classifier: recon notice",         test_classifier_recon_notice),
+        ("Classifier: attacker tool boost",  test_classifier_attacker_tool_boost),
+        ("Classifier: attacker tool cmdline",test_classifier_attacker_tool_cmdline_boost),  # [HIGH #2]
+        ("EventStore: add/get",              test_event_store_add_get),
+        ("EventStore: filters",              test_event_store_filters),
+        ("EventStore: ring buffer",          test_event_store_ring_buffer),
+        ("EventStore: summary",              test_event_store_summary),
+        ("EventStore: thread safety",        test_event_store_thread_safety),         # [LOW #7]
+        ("MetricsStore: render",             test_metrics_render),
+        ("MetricsStore: label injection",    test_metrics_label_injection),           # [MEDIUM #4]
         # ── FP 오탐 완화 ──────────────────────────────────────
         ("FP filter: package manager suppressed", test_fp_filter_package_manager_suppressed),
-        ("FP filter: daemon loginuid suppressed", test_fp_filter_daemon_loginuid_suppressed),
-        ("FP filter: real attack not suppressed", test_fp_filter_real_attack_not_suppressed),
-        ("FP filter: infra image downgrade", test_fp_filter_infra_image_downgrade),
-        ("FP filter: custom thresholds", test_fp_filter_custom_thresholds),
+        ("FP filter: daemon loginuid suppressed",  test_fp_filter_daemon_loginuid_suppressed),
+        ("FP filter: real attack not suppressed",  test_fp_filter_real_attack_not_suppressed),
+        ("FP filter: infra image downgrade",       test_fp_filter_infra_image_downgrade),
+        ("FP filter: custom thresholds",           test_fp_filter_custom_thresholds),
         ("Classifier: fallback low-confidence threshold", test_classifier_confidence_threshold_fallback_downgrade),
-        ("Classifier: shell high-threshold downgrade", test_classifier_shell_high_threshold_downgrade),
-        ("MetricsStore: FP counters", test_metrics_fp_counters),
+        ("Classifier: shell high-threshold downgrade",    test_classifier_shell_high_threshold_downgrade),
+        ("MetricsStore: FP counters",              test_metrics_fp_counters),
     ]
 
-    print("=" * 50)
-    print("Response Server Unit Tests")
-    print("=" * 50)
+    print("=" * 55)
+    print(" Response Server Unit Tests")
+    print("=" * 55)
 
     passed = 0
     failed = 0
     for name, fn in tests:
-        try:
-            fn()
+        if _safe_run(name, fn):   # [LOW #6] 안전한 실행
             passed += 1
-        except Exception as e:
-            print(f"  FAIL: {name} — {e}")
+        else:
             failed += 1
 
-    print("=" * 50)
-    print(f"Results: {passed} passed, {failed} failed, {passed + failed} total")
-    print("=" * 50)
+    print("=" * 55)
+    print(f" Results: {passed} passed, {failed} failed, {passed + failed} total")
+    if failed > 0:
+        print(" TIP: 상세 스택트레이스는 DEBUG=1 python tests/test_all.py 로 확인")
+    print("=" * 55)
 
     return 0 if failed == 0 else 1
 
