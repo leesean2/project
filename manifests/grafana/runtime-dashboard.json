@@ -1,0 +1,253 @@
+{
+  "annotations": { "list": [] },
+  "description": "Policy-as-Code Compliance Platform — Runtime Detection Dashboard",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Runtime Compliance Score",
+      "description": "Overall compliance based on high-severity event rate",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "100 - (compliance_falco_events_total{severity=\"high\"} / (compliance_falco_events_total{severity=\"high\"} + compliance_falco_events_total{severity=\"medium\"} + compliance_falco_events_total{severity=\"low\"} + 1) * 100)",
+          "legendFormat": "Score"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 70 },
+              { "color": "yellow", "value": 85 },
+              { "color": "green", "value": 95 }
+            ]
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        }
+      }
+    },
+    {
+      "title": "Total Events",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(compliance_falco_events_total)",
+          "legendFormat": "Total"
+        }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" } } }
+    },
+    {
+      "title": "HIGH Events",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 9, "y": 0 },
+      "targets": [
+        {
+          "expr": "compliance_falco_events_total{severity=\"high\"}",
+          "legendFormat": "High"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Auto-Isolations",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "compliance_network_isolations_total",
+          "legendFormat": "Isolated"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "AI Fallback Rate",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 15, "y": 0 },
+      "targets": [
+        {
+          "expr": "compliance_ai_fallbacks_total / (compliance_ai_requests_total + 1) * 100",
+          "legendFormat": "Fallback %"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "title": "Isolation Errors",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 6, "y": 3 },
+      "targets": [
+        {
+          "expr": "compliance_network_isolation_errors_total",
+          "legendFormat": "Errors"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Server Uptime",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 9, "y": 3 },
+      "targets": [
+        {
+          "expr": "compliance_server_uptime_seconds",
+          "legendFormat": "Uptime"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Events by Severity Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "rate(compliance_falco_events_total{severity=\"high\"}[5m])",
+          "legendFormat": "High"
+        },
+        {
+          "expr": "rate(compliance_falco_events_total{severity=\"medium\"}[5m])",
+          "legendFormat": "Medium"
+        },
+        {
+          "expr": "rate(compliance_falco_events_total{severity=\"low\"}[5m])",
+          "legendFormat": "Low"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "High" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Medium" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Low" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] }
+        ]
+      }
+    },
+    {
+      "title": "Events by Rule",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "topk(10, compliance_falco_events_by_rule_total)",
+          "legendFormat": "{{rule}}"
+        }
+      ]
+    },
+    {
+      "title": "Events by Namespace",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "compliance_falco_events_by_namespace_total",
+          "legendFormat": "{{namespace}}"
+        }
+      ]
+    },
+    {
+      "title": "Response Actions Distribution",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 14 },
+      "targets": [
+        {
+          "expr": "compliance_response_actions_total",
+          "legendFormat": "{{action}}"
+        }
+      ]
+    },
+    {
+      "title": "AI Classification Latency",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "expr": "rate(compliance_ai_latency_seconds_bucket[5m])",
+          "legendFormat": "{{le}}"
+        }
+      ]
+    },
+    {
+      "title": "Auto-Isolation Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 14 },
+      "targets": [
+        {
+          "expr": "rate(compliance_network_isolations_total[5m])",
+          "legendFormat": "Isolations/sec"
+        },
+        {
+          "expr": "rate(compliance_network_isolation_errors_total[5m])",
+          "legendFormat": "Errors/sec"
+        }
+      ]
+    },
+    {
+      "title": "ISMS-P Compliance Status",
+      "description": "Maps Falco rules to ISMS-P regulation items",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
+      "targets": [
+        {
+          "expr": "compliance_falco_events_by_rule_total",
+          "legendFormat": "{{rule}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "renameByName": { "rule": "Falco Rule", "Value": "Total Events" } } }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["compliance", "falco", "runtime", "isms-p"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Runtime Detection — Compliance Dashboard",
+  "uid": "compliance-runtime-detection",
+  "version": 1
+}

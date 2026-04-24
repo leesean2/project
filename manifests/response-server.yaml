@@ -1,0 +1,221 @@
+# =============================================================
+# Compliance Response Server — Kubernetes Manifests
+# =============================================================
+# Namespace → RBAC → Deployment → Service
+# =============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: compliance-system
+  labels:
+    app.kubernetes.io/part-of: compliance-platform
+
+---
+# ServiceAccount for Response Server
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: response-server
+  namespace: compliance-system
+  labels:
+    app: response-server
+    app.kubernetes.io/part-of: compliance-platform
+
+---
+# ClusterRole — needs to create NetworkPolicies and read Pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: compliance-response-server
+  labels:
+    app: response-server
+    app.kubernetes.io/part-of: compliance-platform
+rules:
+  # Create/delete NetworkPolicies for auto-isolation
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "delete", "get", "list"]
+  # Read Pod metadata (labels) for NetworkPolicy targeting
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # Read namespaces for filtering
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: compliance-response-server
+  labels:
+    app: response-server
+    app.kubernetes.io/part-of: compliance-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: compliance-response-server
+subjects:
+  - kind: ServiceAccount
+    name: response-server
+    namespace: compliance-system
+
+---
+# ConfigMap for environment configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: response-server-config
+  namespace: compliance-system
+  labels:
+    app: response-server
+data:
+  SERVER_PORT: "5000"
+  AUTO_ISOLATE: "true"
+  LOG_LEVEL: "INFO"
+  EVENT_STORE_SIZE: "2000"
+  # AI_ENDPOINT: Set this when AI module (이온) is ready
+  # Example: "http://ai-classifier.compliance-system.svc.cluster.local:8000/classify"
+  AI_ENDPOINT: ""
+  AI_TIMEOUT: "5"
+  # Falco 침묵 탐지: N초 동안 이벤트 없으면 CRITICAL 경보
+  # falco-watchdog 타이머가 30초 간격이므로 90초(3회 미수신)로 설정
+  HEARTBEAT_SILENCE_THRESHOLD: "90"
+  # 침묵 감지 체크 주기 (초)
+  HEARTBEAT_CHECK_INTERVAL: "30"
+  # ── Webhook 보안 설정 ─────────────────────────────────
+  # WEBHOOK_SECRET은 별도 Secret 오브젝트에서 주입 (아래 webhook-secret 참조)
+  # True이면 HMAC 없는 요청 거부 (08-setup-signing-proxy.sh 실행 후 "true"로 변경)
+  WEBHOOK_HMAC_REQUIRED: "false"
+  # 허용 소스 IP (CIDR 가능). 서명 프록시가 X-Forwarded-For: 127.0.0.1 추가.
+  WEBHOOK_IP_WHITELIST: "127.0.0.1,::1"
+  # IP당 burst 허용 요청 수 (토큰 버킷 초기 용량)
+  RATE_LIMIT_CAPACITY: "100"
+  # IP당 초당 토큰 충전 속도 (지속 허용 RPS)
+  RATE_LIMIT_REFILL_RATE: "3.0"
+
+---
+# Webhook HMAC 비밀키 Secret
+# 실제 값은 08-setup-signing-proxy.sh 에서 자동 생성 후 kubectl로 주입됨
+# 이 파일의 WEBHOOK_SECRET은 빈 값 placeholder — 절대 커밋하지 말 것
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webhook-secret
+  namespace: compliance-system
+  labels:
+    app: response-server
+    app.kubernetes.io/part-of: compliance-platform
+type: Opaque
+stringData:
+  WEBHOOK_SECRET: ""
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: response-server
+  namespace: compliance-system
+  labels:
+    app: response-server
+    app.kubernetes.io/part-of: compliance-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: response-server
+  template:
+    metadata:
+      labels:
+        app: response-server
+        app.kubernetes.io/part-of: compliance-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: response-server
+      containers:
+        - name: response-server
+          image: compliance-response-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: response-server-config
+            - secretRef:
+                name: webhook-secret
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000  
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+---
+# Service — ClusterIP (Sidekick connects internally)
+apiVersion: v1
+kind: Service
+metadata:
+  name: response-server
+  namespace: compliance-system
+  labels:
+    app: response-server
+    app.kubernetes.io/part-of: compliance-platform
+spec:
+  type: ClusterIP
+  selector:
+    app: response-server
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http
+      protocol: TCP
+
+---
+# NodePort for debugging (optional, remove in production)
+apiVersion: v1
+kind: Service
+metadata:
+  name: response-server-debug
+  namespace: compliance-system
+  labels:
+    app: response-server
+spec:
+  type: NodePort
+  selector:
+    app: response-server
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http
+      nodePort: 30500
+      protocol: TCP

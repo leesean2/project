@@ -1,0 +1,67 @@
+# =============================================================
+# AI Classification Module — API Specification
+# =============================================================
+# Interface contract between Runtime Detection (이은성)
+# and AI Module (이온)
+#
+# Response Server → AI Classifier → Response Server
+# =============================================================
+
+# ─── Endpoint ─────────────────────────────────────────────
+# POST /classify
+# Content-Type: application/json
+
+# ─── Request Body ─────────────────────────────────────────
+# {
+#   "rule": "Compliance - Shell Spawned in Container",
+#   "priority": "WARNING",
+#   "output": "Shell spawned in container (shell=bash parent=containerd-shim ...)",
+#   "output_fields": {
+#     "proc.name": "bash",
+#     "proc.pname": "containerd-shim",
+#     "proc.cmdline": "bash",
+#     "user.name": "root",
+#     "user.uid": 0,
+#     "container.id": "abc123def456",
+#     "container.name": "app",
+#     "container.image.repository": "ubuntu",
+#     "k8s.ns.name": "test-workloads",
+#     "k8s.pod.name": "vulnerable-app",
+#     "fd.name": "",
+#     "evt.type": "execve"
+#   },
+#   "tags": ["compliance", "isms-p-2.6.1", "shell", "runtime"],
+#   "time": "2025-01-15T09:30:00.123456789Z"
+# }
+
+# ─── Response Body ────────────────────────────────────────
+# {
+#   "severity": "medium",    # "low" | "medium" | "high"
+#   "reason": "Shell access detected but from known maintenance image",
+#   "confidence": 0.85       # optional, 0.0~1.0
+# }
+
+# ─── Severity Definitions ─────────────────────────────────
+# low:    Normal behavior or very low risk
+#         Action: Log only
+#         Example: Developer running 'whoami' in debug pod
+#
+# medium: Suspicious but not immediately dangerous
+#         Action: Alert + enhanced monitoring
+#         Example: Shell spawned in production container
+#
+# high:   Active threat requiring immediate response
+#         Action: NetworkPolicy auto-isolation + alert
+#         Example: Privilege escalation, /etc/shadow read + outbound connection
+
+# ─── Timeout / Error Handling ─────────────────────────────
+# - Response Server waits max 5 seconds (configurable via AI_TIMEOUT)
+# - On timeout or error: falls back to rule-based classification
+# - Fallback logic: Falco priority → severity mapping
+#   Emergency/Alert/Critical → high
+#   Error/Warning → medium
+#   Notice/Info/Debug → low
+
+# ─── Environment Variable ─────────────────────────────────
+# AI_ENDPOINT=http://ai-classifier.compliance-system.svc.cluster.local:8000/classify
+# Set in manifests/response-server.yaml ConfigMap when AI module is ready

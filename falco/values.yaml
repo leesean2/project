@@ -1,0 +1,360 @@
+# =============================================================
+# Falco Helm Values — Compliance Platform Runtime Detection
+# =============================================================
+# Driver: modern_ebpf (no kernel module required)
+# Sidekick: enabled with webhook + Prometheus exporter
+# =============================================================
+
+# --- Falco Core ---
+driver:
+  enabled: false
+  kind: modern_ebpf    # No kernel module, works on managed K8s (EKS/GKE/kind)
+
+tty: false
+
+falco:
+  grpc:
+    enabled: true
+    threadiness: 4
+  grpc_output:
+    enabled: true
+  priority: NOTICE
+  load_plugins: [ "k8s-audit", "json" ]
+
+  # JSON output for structured parsing
+  json_output: true
+  json_include_output_property: true
+  json_include_tags_property: true
+
+  # Log level
+  log_level: info
+
+  # Priority filter — NOTICE 이상 출력 (커스텀 룰 3,4가 NOTICE)
+  priority: NOTICE
+
+  # Rules files
+  rules_files:
+    - /etc/falco/falco_rules.yaml
+    - /etc/falco/falco_rules.local.yaml
+    - /etc/falco/rules.d
+
+# --- Custom Rules (ISMS-P Compliance) ---
+customRules:
+  compliance-rules.yaml: |-
+    ##########################################################
+    # Policy-as-Code Compliance Platform — Custom Falco Rules
+    # ISMS-P / PCI-DSS Mapped Runtime Detection Rules
+    ##########################################################
+
+    # --------------------------------------------------------
+    # RULE 1: Sensitive File Access in Container
+    # ISMS-P 2.6.1 Access Control
+    # PCI-DSS 7.1 Restrict access to system components
+    # --------------------------------------------------------
+    - rule: Compliance - Read Sensitive File in Container
+      desc: >
+        Detect read access to sensitive files (/etc/shadow, /etc/passwd, 
+        private keys, kubeconfig) inside containers.
+        Maps to ISMS-P 2.6.1 Access Control Policy.
+      condition: >
+        evt.type in (open, openat, openat2) and
+        evt.dir = < and
+        container.id != host and
+        (fd.name startswith /etc/shadow or
+         fd.name startswith /etc/passwd or
+         fd.name startswith /etc/kubernetes or
+         fd.name startswith /root/.kube or
+         fd.name contains id_rsa or
+         fd.name contains id_ed25519) and
+        not proc.name in (sshd, systemd, login, passwd, su, sudo, useradd, userdel, groupadd, adduser)
+      output: >
+        Sensitive file read in container
+        (file=%fd.name user=%user.name user_uid=%user.uid command=%proc.cmdline
+        pid=%proc.pid container_id=%container.id container_name=%container.name
+        image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [compliance, isms-p-2.6.1, pci-dss-7.1, file-access, runtime]
+
+    # --------------------------------------------------------
+    # RULE 2: Shell Spawned in Container
+    # ISMS-P 2.6.1 Access Control
+    # --------------------------------------------------------
+    - rule: Compliance - Shell Spawned in Container
+      desc: >
+        Detect interactive shell execution inside a running container.
+        Indicates potential unauthorized access or lateral movement.
+        Maps to ISMS-P 2.6.1 Access Control Policy.
+      condition: >
+        evt.type = execve and
+        evt.dir = < and
+        container.id != host and
+        proc.name in (bash, sh, dash, zsh, csh, ksh, fish, ash) and
+        proc.tty != 0 and
+        not proc.pname in (cron, crond, supervisord, containerd-shim)
+      output: >
+        Shell spawned in container
+        (shell=%proc.name parent=%proc.pname user=%user.name
+        command=%proc.cmdline pid=%proc.pid
+        container_id=%container.id container_name=%container.name
+        image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [compliance, isms-p-2.6.1, shell, runtime]
+
+    # --------------------------------------------------------
+    # RULE 3: Outbound Connection from Container
+    # ISMS-P 2.6.7 Internet Access Control
+    # PCI-DSS 1.3 Restrict inbound/outbound traffic
+    # --------------------------------------------------------
+    - rule: Compliance - Unexpected Outbound Connection
+      desc: >
+        Detect outbound network connections to external IPs from containers.
+        Potential C2 communication or data exfiltration.
+        Maps to ISMS-P 2.6.7 Internet Access Control.
+      condition: >
+        evt.type in (connect) and
+        evt.dir = < and
+        container.id != host and
+        fd.typechar = 4 and
+        fd.ip != "0.0.0.0" and
+        not fd.sip in (
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "127.0.0.0/8"
+        ) and
+        not proc.name in (coredns, kubelet, kube-proxy, falco, node-exporter)
+      output: >
+        Unexpected outbound connection from container
+        (command=%proc.cmdline connection=%fd.name dest_ip=%fd.sip dest_port=%fd.sport
+        user=%user.name container_id=%container.id container_name=%container.name
+        image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: NOTICE
+      tags: [compliance, isms-p-2.6.7, pci-dss-1.3, network, exfiltration, runtime]
+
+    # --------------------------------------------------------
+    # RULE 4: Process Reconnaissance in Container
+    # ISMS-P 2.11.4 Incident Response
+    # --------------------------------------------------------
+    - rule: Compliance - Container Reconnaissance Activity
+      desc: >
+        Detect reconnaissance commands inside containers (proc scanning,
+        network discovery, system enumeration).
+        Maps to ISMS-P 2.11.4 Incident Response.
+      condition: >
+        evt.type = execve and
+        evt.dir = < and
+        container.id != host and
+        (proc.name in (nmap, nc, ncat, netcat, wget, curl, dig, nslookup, ip, ifconfig, ss, netstat, ps, whoami, id, uname, cat, find) and
+         (proc.cmdline contains "/proc" or
+          proc.cmdline contains "/sys" or
+          proc.cmdline contains "ifconfig" or
+          proc.cmdline contains "ss -" or
+          proc.cmdline contains "netstat" or
+          proc.cmdline contains "nmap" or
+          proc.cmdline contains "whoami" or
+          proc.cmdline contains "id" or
+          proc.cmdline contains "/etc/resolv"))
+      output: >
+        Reconnaissance activity in container
+        (command=%proc.cmdline user=%user.name pid=%proc.pid
+        container_id=%container.id container_name=%container.name
+        image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: NOTICE
+      tags: [compliance, isms-p-2.11.4, reconnaissance, runtime]
+
+    # --------------------------------------------------------
+    # RULE 5: Privilege Escalation Attempt
+    # ISMS-P 2.6.1 Access Control
+    # PCI-DSS 7.1 Restrict access
+    # --------------------------------------------------------
+    - rule: Compliance - Privilege Escalation in Container
+      desc: >
+        Detect privilege escalation attempts inside containers
+        (setuid, setgid, capability manipulation).
+        Maps to ISMS-P 2.6.1 Access Control Policy.
+      condition: >
+        evt.type in (setuid, setgid, setresuid, setresgid) and
+        evt.dir = < and
+        container.id != host and
+        user.uid != 0 and
+        (evt.arg.uid = 0 or evt.arg.euid = 0) and
+        not proc.name in (su, sudo, sshd, login, cron, crond)
+      output: >
+        Privilege escalation attempt in container
+        (command=%proc.cmdline target_uid=%evt.arg.uid user=%user.name user_uid=%user.uid
+        container_id=%container.id container_name=%container.name
+        image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [compliance, isms-p-2.6.1, pci-dss-7.1, privilege-escalation, runtime]
+
+    # --------------------------------------------------------
+    # RULE 6: File Modification in Read-Only Paths
+    # ISMS-P 2.11.1 Incident Prevention
+    # --------------------------------------------------------
+    - rule: Compliance - Write to Monitored Directory
+      desc: >
+        Detect file writes to critical directories inside containers.
+        Indicates potential malware installation or config tampering.
+        Maps to ISMS-P 2.11.1 Incident Prevention.
+      condition: >
+        evt.type in (open, openat, openat2) and
+        evt.dir = < and
+        container.id != host and
+        (evt.arg.flags contains O_WRONLY or evt.arg.flags contains O_RDWR) and
+        (fd.name startswith /bin or
+         fd.name startswith /sbin or
+         fd.name startswith /usr/bin or
+         fd.name startswith /usr/sbin or
+         fd.name startswith /etc/cron or
+         fd.name startswith /etc/init.d) and
+        not proc.name in (apt, apt-get, dpkg, yum, rpm, pip, npm, apk)
+      output: >
+        Write to monitored directory in container
+        (file=%fd.name command=%proc.cmdline user=%user.name
+        container_id=%container.id container_name=%container.name
+        image=%container.image.repository
+        k8s_ns=%k8s.ns.name k8s_pod=%k8s.pod.name)
+      priority: ERROR
+      tags: [compliance, isms-p-2.11.1, file-integrity, runtime]
+
+    # --------------------------------------------------------
+    # Falco Self-Protection Rules
+    # 목적: Falco 바이너리/룰/설정 변조 탐지 + heartbeat canary
+    # --------------------------------------------------------
+    - rule: Falco Tamper - Binary Write Attempt
+      desc: >
+        Falco 바이너리(/usr/bin/falco)에 대한 쓰기 시도 탐지.
+        chattr +i 로 차단되더라도 시도 자체를 CRITICAL로 기록.
+      condition: >
+        evt.type in (open, openat, openat2) and
+        evt.dir = < and
+        container.id = host and
+        (evt.arg.flags contains O_WRONLY or
+         evt.arg.flags contains O_RDWR or
+         evt.arg.flags contains O_CREAT or
+         evt.arg.flags contains O_TRUNC) and
+        fd.name in (/usr/bin/falco, /usr/bin/falcoctl) and
+        not proc.name in (apt, apt-get, dpkg, falco-installer)
+      output: >
+        Falco binary write attempt BLOCKED by chattr+i
+        (file=%fd.name command=%proc.cmdline user=%user.name
+        uid=%user.uid pid=%proc.pid result=%evt.res)
+      priority: CRITICAL
+      tags: [falco-protection, tamper, isms-p-2.11.1]
+
+    - rule: Falco Tamper - Rules File Write Attempt
+      desc: >
+        /etc/falco/ 하위 파일(룰, 설정)에 대한 쓰기 시도 탐지.
+        공격자가 탐지 룰을 무력화하려는 시도.
+      condition: >
+        evt.type in (open, openat, openat2) and
+        evt.dir = < and
+        container.id = host and
+        (evt.arg.flags contains O_WRONLY or
+         evt.arg.flags contains O_RDWR or
+         evt.arg.flags contains O_CREAT or
+         evt.arg.flags contains O_TRUNC) and
+        fd.name startswith /etc/falco/ and
+        not proc.name in (apt, apt-get, dpkg, bash, sh, deploy-falco)
+      output: >
+        Falco config/rules write attempt
+        (file=%fd.name command=%proc.cmdline user=%user.name
+        uid=%user.uid pid=%proc.pid result=%evt.res)
+      priority: CRITICAL
+      tags: [falco-protection, tamper, isms-p-2.11.1]
+
+    - rule: Falco Tamper - Remove Immutability
+      desc: >
+        chattr 명령으로 Falco 관련 파일의 immutable 속성 제거 시도.
+      condition: >
+        evt.type = execve and
+        evt.dir = < and
+        container.id = host and
+        proc.name = chattr and
+        (proc.cmdline contains "falco" or
+         proc.cmdline contains "/etc/falco")
+      output: >
+        chattr on Falco files — possible immutability removal
+        (command=%proc.cmdline user=%user.name uid=%user.uid pid=%proc.pid)
+      priority: CRITICAL
+      tags: [falco-protection, tamper, chattr]
+
+    - rule: Falco Tamper - Stop or Disable Service
+      desc: >
+        systemctl을 이용한 Falco 서비스 중지/비활성화/마스킹 시도.
+      condition: >
+        evt.type = execve and
+        evt.dir = < and
+        container.id = host and
+        proc.name = systemctl and
+        (proc.cmdline contains "stop falco" or
+         proc.cmdline contains "disable falco" or
+         proc.cmdline contains "mask falco" or
+         proc.cmdline contains "kill falco")
+      output: >
+        Falco service stop/disable attempt via systemctl
+        (command=%proc.cmdline user=%user.name uid=%user.uid pid=%proc.pid)
+      priority: CRITICAL
+      tags: [falco-protection, service-tamper]
+
+    - rule: Falco Heartbeat Canary
+      desc: >
+        30초마다 falco-watchdog 서비스가 /var/run/falco-heartbeat 를 touch.
+        이 룰이 발화하면 Falco 탐지 파이프라인이 정상 동작 중임을 의미.
+        Response Server에서 90초 이상 수신 없으면 CRITICAL 경보 발생.
+      condition: >
+        evt.type in (open, openat, openat2) and
+        evt.dir = < and
+        container.id = host and
+        fd.name = /var/run/falco-heartbeat and
+        proc.name in (falco-watchdog, bash, touch)
+      output: >
+        Falco heartbeat canary OK
+        (ts=%evt.time proc=%proc.name pid=%proc.pid)
+      priority: NOTICE
+      tags: [heartbeat, falco-health]
+
+# --- Falco Sidekick ---
+falcosidekick:
+  enabled: true
+
+  config:
+    # Webhook to Python Response Server
+    webhook:
+      address: "http://response-server.compliance-system.svc.cluster.local:5000/webhook"
+      method: "POST"
+      minimumpriority: "notice"
+
+  # Prometheus exporter for Sidekick metrics
+  # -> Falco event count by priority, rule, etc.
+  webui:
+    enabled: true
+    service:
+      type: ClusterIP
+
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: false  # Enable if using Prometheus Operator
+
+  service:
+    type: ClusterIP
+
+# --- Resource Limits ---
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# --- Tolerations for kind ---
+tolerations:
+  - effect: NoSchedule
+    operator: Exists
