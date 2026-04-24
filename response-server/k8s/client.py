@@ -12,6 +12,7 @@ import logging
 import ssl
 import threading
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -74,12 +75,12 @@ class KubeClient:
                 self._ssl_ctx = ssl.create_default_context(cafile=self.ca_path)
             except FileNotFoundError:
                 raise RuntimeError(
-                    f"서비스 어카운트 CA 인증서를 찾을 수 없습니다: {self.ca_path}. "
+                    "서비스 어카운트 CA 인증서를 찾을 수 없습니다. "
                     "클러스터 내부에서 실행 중인지 확인하세요."
                 )
             except ssl.SSLError as e:
                 raise RuntimeError(
-                    f"CA 인증서 로딩 실패: {e}. "
+                    f"CA 인증서 로딩 실패 (ssl): {type(e).__name__}. "
                     "인증서 파일이 유효한지 확인하세요."
                 ) from e
         return self._ssl_ctx
@@ -98,8 +99,10 @@ class KubeClient:
                                         timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
+            # [정보 노출 방지] 응답 본문 200자 제한, URL에서 민감한 경로 제거
             error_body = e.read().decode("utf-8", errors="replace")
-            logger.error("K8s API %s %s → %d: %s", method, url, e.code, error_body[:500])
+            url_path = urllib.parse.urlparse(url).path if url else ""
+            logger.error("K8s API %s %s → %d: %s", method, url_path, e.code, error_body[:200])
             return None
         except Exception as e:
             logger.error("K8s API %s %s → error: %s", method, url, e)
