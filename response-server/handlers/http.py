@@ -16,15 +16,52 @@ Endpoints:
 
   POST /api/v1/heartbeat     — Watchdog heartbeat (falco-watchdog systemd service)
   GET  /api/v1/falco/status  — Falco heartbeat / silence detection status
+
+Security changes (vs original):
+  [HIGH #4] POST /api/v1/heartbeat  — HEARTBEAT_TOKEN HMAC 인증 추가
+  [HIGH #5] DELETE /api/v1/isolations — API_TOKEN Bearer 인증 추가
+  [HIGH #6] CORS Access-Control-Allow-Origin — 와일드카드(*) → 환경변수 화이트리스트
+  [MEDIUM #7] GET /api/v1/events?limit — 최대 500건 상한 추가
 """
 
+import hmac
 import json
 import logging
+import os
 import threading
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 logger = logging.getLogger("handler")
+
+# ─── 인증 설정 (환경변수에서 주입) ─────────────────────────────
+# ConfigMap: HEARTBEAT_TOKEN, API_TOKEN, ALLOWED_ORIGINS
+# Secret:    WEBHOOK_SECRET (webhook security 모듈에서 별도 처리)
+
+# POST /api/v1/heartbeat 인증 토큰
+_HEARTBEAT_TOKEN: str = os.environ.get("HEARTBEAT_TOKEN", "")
+
+# DELETE /api/v1/isolations + GET /api/v1/* 인증 토큰
+_API_TOKEN: str = os.environ.get("API_TOKEN", "")
+
+# CORS 허용 오리진 목록 (쉼표 구분)
+# 예: "http://localhost:3000,http://grafana.monitoring.svc:3000"
+_ALLOWED_ORIGINS: list[str] = [
+    o.strip()
+    for o in os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
+
+# GET /api/v1/events?limit 최대 허용값
+_MAX_EVENT_LIMIT: int = 500
+
+
+def _constant_time_eq(a: str, b: str) -> bool:
+    """타이밍 공격 방지를 위한 상수 시간 문자열 비교."""
+    return hmac.compare_digest(
+        a.encode("utf-8"),
+        b.encode("utf-8"),
+    )
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -76,6 +113,10 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path = urlparse(self.path).path
 
+        # [HIGH #5] DELETE는 API_TOKEN Bearer 인증 필요
+        if not self._check_api_auth():
+            return
+
         # DELETE /api/v1/isolations/:namespace/:policy_name
         if path.startswith("/api/v1/isolations/"):
             parts = path.split("/")
@@ -87,6 +128,78 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "expected /api/v1/isolations/:ns/:name"})
         else:
             self._send_json(404, {"error": "not found"})
+
+    # ─── 인증 헬퍼 ────────────────────────────────────────
+
+    def _check_api_auth(self) -> bool:
+        """
+        [HIGH #5] Bearer 토큰 인증.
+
+        Authorization: Bearer <API_TOKEN> 헤더 검증.
+        API_TOKEN이 비어있으면 서버 설정 오류로 간주하여 503 반환.
+        인증 실패 시 401을 반환하고 False를 리턴.
+        """
+        if not _API_TOKEN:
+            logger.critical(
+                "API_TOKEN is not set — refusing all authenticated requests. "
+                "Set API_TOKEN environment variable."
+            )
+            self._send_json(503, {"error": "server misconfiguration: API_TOKEN not set"})
+            return False
+
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            logger.warning(
+                "API auth failed: missing Bearer token from %s",
+                self.client_address[0] if self.client_address else "unknown",
+            )
+            self._send_json(401, {"error": "unauthorized: Bearer token required"})
+            return False
+
+        provided_token = auth_header[len("Bearer "):]
+        if not _constant_time_eq(provided_token, _API_TOKEN):
+            logger.warning(
+                "API auth failed: invalid token from %s",
+                self.client_address[0] if self.client_address else "unknown",
+            )
+            self._send_json(401, {"error": "unauthorized: invalid token"})
+            return False
+
+        return True
+
+    def _check_heartbeat_auth(self) -> bool:
+        """
+        [HIGH #4] Heartbeat 전용 토큰 인증.
+
+        X-Watchdog-Token: <HEARTBEAT_TOKEN> 헤더 검증.
+        HEARTBEAT_TOKEN이 비어있으면 503 반환.
+        """
+        if not _HEARTBEAT_TOKEN:
+            logger.critical(
+                "HEARTBEAT_TOKEN is not set — refusing heartbeat requests. "
+                "Set HEARTBEAT_TOKEN environment variable."
+            )
+            self._send_json(503, {"error": "server misconfiguration: HEARTBEAT_TOKEN not set"})
+            return False
+
+        provided = self.headers.get("X-Watchdog-Token", "")
+        if not provided:
+            logger.warning(
+                "Heartbeat auth failed: missing X-Watchdog-Token from %s",
+                self.client_address[0] if self.client_address else "unknown",
+            )
+            self._send_json(401, {"error": "unauthorized: X-Watchdog-Token required"})
+            return False
+
+        if not _constant_time_eq(provided, _HEARTBEAT_TOKEN):
+            logger.warning(
+                "Heartbeat auth failed: invalid token from %s",
+                self.client_address[0] if self.client_address else "unknown",
+            )
+            self._send_json(401, {"error": "unauthorized: invalid heartbeat token"})
+            return False
+
+        return True
 
     # ─── Webhook Handler ──────────────────────────────────
 
@@ -169,13 +282,24 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _handle_list_events(self):
         """
         GET /api/v1/events?severity=high&namespace=default&limit=50
+
+        [MEDIUM #7] limit 파라미터 최대값 _MAX_EVENT_LIMIT(500)으로 제한.
+        음수 또는 비정수 값은 기본값(50)으로 대체.
         """
         params = parse_qs(urlparse(self.path).query)
         store = self.server.store
 
         severity = params.get("severity", [None])[0]
         namespace = params.get("namespace", [None])[0]
-        limit = int(params.get("limit", ["50"])[0])
+
+        # [MEDIUM #7] limit 검증
+        try:
+            limit = int(params.get("limit", ["50"])[0])
+            if limit <= 0:
+                limit = 50
+            limit = min(limit, _MAX_EVENT_LIMIT)  # 최대 500건 상한
+        except (ValueError, TypeError):
+            limit = 50
 
         if severity:
             events = store.get_by_severity(severity)
@@ -217,9 +341,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_delete_isolation(self, namespace: str, policy_name: str):
-        """DELETE /api/v1/isolations/:ns/:name — remove isolation."""
+        """
+        DELETE /api/v1/isolations/:ns/:name — remove isolation.
+        인증은 do_DELETE()에서 _check_api_auth()로 사전 처리됨.
+        """
         success = self.server.kube.delete_isolation_policy(namespace, policy_name)
         if success:
+            logger.info(
+                "Isolation deleted by API: %s/%s from %s",
+                namespace, policy_name,
+                self.client_address[0] if self.client_address else "unknown",
+            )
             self._send_json(200, {
                 "status": "deleted",
                 "namespace": namespace,
@@ -236,7 +368,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         """
         POST /api/v1/heartbeat — falco-watchdog systemd 서비스에서 30초마다 호출.
         Falco 프로세스 생존 여부를 직접 전달하는 독립 경로.
+
+        [HIGH #4] X-Watchdog-Token 헤더로 HEARTBEAT_TOKEN 검증.
+        인증 실패 시 401 반환, heartbeat 기록하지 않음.
         """
+        # [HIGH #4] 인증 먼저
+        if not self._check_heartbeat_auth():
+            return
+
         try:
             content_length = int(self.headers.get("Content-Length", 0))
             body = {}
@@ -282,12 +421,31 @@ class RequestHandler(BaseHTTPRequestHandler):
     # ─── Response Helpers ─────────────────────────────────
 
     def _send_json(self, status: int, data: dict):
+        """
+        [HIGH #6] CORS: Access-Control-Allow-Origin을 와일드카드(*)에서
+        ALLOWED_ORIGINS 환경변수 기반 화이트리스트로 변경.
+
+        요청의 Origin 헤더가 허용 목록에 있으면 해당 오리진을 반환.
+        없으면 허용 목록의 첫 번째 오리진을 반환 (브라우저가 CORS 차단함).
+        """
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        # CORS for dashboard access
-        self.send_header("Access-Control-Allow-Origin", "*")
+
+        # [HIGH #6] CORS 화이트리스트 처리
+        request_origin = self.headers.get("Origin", "")
+        if request_origin in _ALLOWED_ORIGINS:
+            allowed_origin = request_origin
+        else:
+            # 허용되지 않은 오리진 → 첫 번째 허용 오리진 반환
+            # 브라우저는 오리진 불일치로 CORS 차단, 서버는 정상 응답
+            allowed_origin = _ALLOWED_ORIGINS[0] if _ALLOWED_ORIGINS else ""
+
+        if allowed_origin:
+            self.send_header("Access-Control-Allow-Origin", allowed_origin)
+            self.send_header("Vary", "Origin")  # 프록시 캐시 오염 방지
+
         self.end_headers()
         self.wfile.write(body)
 
