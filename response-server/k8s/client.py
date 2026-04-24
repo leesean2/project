@@ -49,15 +49,20 @@ class KubeClient:
         return self._token
 
     def _get_ssl_ctx(self) -> ssl.SSLContext:
-        if self._ssl_ctx is None:
-            try:
-                self._ssl_ctx = ssl.create_default_context(cafile=self.ca_path)
-            except (FileNotFoundError, ssl.SSLError):
-                logger.warning("CA cert not found, using unverified SSL")
-                self._ssl_ctx = ssl.create_default_context()
-                self._ssl_ctx.check_hostname = False
-                self._ssl_ctx.verify_mode = ssl.CERT_NONE
-        return self._ssl_ctx
+    if self._ssl_ctx is None:
+        try:
+            self._ssl_ctx = ssl.create_default_context(cafile=self.ca_path)
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"서비스 어카운트 CA 인증서를 찾을 수 없습니다: {self.ca_path}. "
+                "클러스터 내부에서 실행 중인지 확인하세요."
+            )
+        except ssl.SSLError as e:
+            raise RuntimeError(
+                f"CA 인증서 로딩 실패: {e}. "
+                "인증서 파일이 유효한지 확인하세요."
+            ) from e
+    return self._ssl_ctx
 
     def _request(self, method: str, url: str, body: Optional[bytes] = None,
                  timeout: int = 10) -> Optional[dict]:
