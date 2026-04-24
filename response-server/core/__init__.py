@@ -99,10 +99,13 @@ class EventStore:
                 summary["by_action"][r.action_taken] = \
                     summary["by_action"].get(r.action_taken, 0) + 1
 
-            # Last 10 high-severity events
+            # Last 10 high-severity events — timestamp 기준 최신순 정렬 보장
+            # [LOW #10] deque 순서는 삽입 순서이므로 타임스탬프 역전이 없다면
+            # 문제없지만, 명시적으로 정렬하여 대시보드 표시 순서를 보장.
             high_events = [r for r in self._events if r.severity == "high"]
+            high_events.sort(key=lambda r: r.timestamp, reverse=True)
             summary["recent_high"] = [
-                r.to_dict() for r in high_events[-10:]
+                r.to_dict() for r in high_events[:10]
             ]
 
             return summary

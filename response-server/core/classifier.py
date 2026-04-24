@@ -174,19 +174,43 @@ class ThreatClassifier:
                     self.metrics.observe_ai_latency(duration)
 
                 result = json.loads(resp.read().decode("utf-8"))
-                severity = result.get("severity", "medium").lower()
+
+                # [MEDIUM #4] AI 응답 검증 — severity는 허용 목록만 수용
+                raw_severity = result.get("severity", "medium")
+                if not isinstance(raw_severity, str):
+                    raw_severity = "medium"
+                severity = raw_severity.lower().strip()
                 if severity not in SEVERITY_ORDER:
+                    logger.warning(
+                        "AI returned unknown severity '%s' — defaulting to medium",
+                        severity,
+                    )
                     severity = "medium"
+
+                # [MEDIUM #4] confidence 범위 검증 (0.0 ~ 1.0)
+                raw_conf = result.get("confidence", 0.0)
+                try:
+                    confidence = float(raw_conf)
+                    confidence = max(0.0, min(1.0, confidence))
+                except (TypeError, ValueError):
+                    logger.warning("AI returned invalid confidence '%s' — defaulting to 0.0", raw_conf)
+                    confidence = 0.0
+
+                # [MEDIUM #4] reason 길이 제한 — 로그/DB 오염 방지
+                raw_reason = result.get("reason", "AI classification")
+                if not isinstance(raw_reason, str):
+                    raw_reason = "AI classification"
+                reason = raw_reason[:256]
 
                 logger.info(
                     "AI classification: severity=%s confidence=%.2f (%.3fs)",
-                    severity, result.get("confidence", 0), duration,
+                    severity, confidence, duration,
                 )
 
                 return Classification(
                     severity=severity,
-                    reason=result.get("reason", "AI classification"),
-                    confidence=result.get("confidence", 0.0),
+                    reason=reason,
+                    confidence=confidence,
                     source="ai",
                 )
 
@@ -253,10 +277,18 @@ class ThreatClassifier:
             score += CONTEXT_WEIGHTS["prod_namespace"]
             reasons.append(f"ctx:prod_ns({event.k8s.namespace})")
 
-        # Attacker tools? (exact proc.name match only — no substring)
+        # Attacker tools?
+        # [MEDIUM #5] proc.name 단독 체크는 /bin/sh nmap 처럼 부모 셸을 통한
+        # 우회에 취약. cmdline에서도 공격 도구 키워드를 확인하여 탐지 강화.
+        cmdline_lower = cmdline.lower()
         if proc_name in ATTACKER_TOOLS:
             score += CONTEXT_WEIGHTS["attacker_tool"]
-            reasons.append(f"ctx:attacker_tool({proc_name})")
+            reasons.append(f"ctx:attacker_tool(proc={proc_name})")
+        elif any(tool in cmdline_lower for tool in ATTACKER_TOOLS):
+            # cmdline 매칭은 proc.name보다 약한 신호 — 가중치 절반 적용
+            matched = next(t for t in ATTACKER_TOOLS if t in cmdline_lower)
+            score += max(1, CONTEXT_WEIGHTS["attacker_tool"] // 2)
+            reasons.append(f"ctx:attacker_tool(cmdline={matched})")
 
         # Multiple tags suggesting compound threat?
         threat_tags = {"privilege-escalation", "exfiltration", "shell", "file-access"}

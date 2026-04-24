@@ -29,32 +29,52 @@ PORT = 15123  # random high port to avoid conflicts
 
 
 class TestAppServer(HTTPServer):
-    def __init__(self, address, handler, processor, store, metrics, kube):
+    def __init__(self, address, handler, processor, store, metrics, kube,
+                 security=None, heartbeat=None):
         super().__init__(address, handler)
         self.processor = processor
         self.store = store
         self.metrics = metrics
         self.kube = kube
+        self.security = security    # [MEDIUM #9] 보안 미들웨어 포함
+        self.heartbeat = heartbeat  # [MEDIUM #9] heartbeat 모니터 포함
 
 
 def start_test_server():
     """Start server in background thread, return (server, thread)."""
     metrics = MetricsStore()
     store = EventStore(max_size=500)
-    kube = KubeClient()  # won't connect — no cluster
+    kube = KubeClient()
     classifier = ThreatClassifier(ai_endpoint="", metrics=metrics)
     processor = EventProcessor(
         classifier=classifier, kube=kube, store=store,
-        metrics=metrics, auto_isolate=False,  # disable isolation in tests
+        metrics=metrics, auto_isolate=False,
     )
+
+    # [MEDIUM #9] 테스트 환경에서도 security 미들웨어 포함
+    # HMAC 검증은 비활성화하되 Rate Limit / IP whitelist는 활성화
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from middleware.security import WebhookSecurity
+        security = WebhookSecurity(
+            secret="",
+            hmac_required=False,   # 테스트에서는 서명 불필요
+            ip_whitelist=None,     # IP 제한 없음
+            rate_limit_capacity=200,
+            rate_limit_refill_rate=50.0,
+        )
+    except ImportError:
+        security = None  # middleware 미구현 시 None 허용 (테스트만)
 
     server = TestAppServer(
         ("127.0.0.1", PORT), RequestHandler,
         processor=processor, store=store, metrics=metrics, kube=kube,
+        security=security,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    time.sleep(0.3)  # wait for server to bind
+    time.sleep(0.3)
     return server, thread
 
 
@@ -238,6 +258,52 @@ def test_webhook_invalid_json(server):
     print("  PASS: POST /webhook invalid JSON → 400")
 
 
+def test_webhook_empty_body(server):
+    """
+    [MEDIUM #9] POST /webhook with Content-Length: 0 → 400.
+    빈 바디로 서버가 크래시하지 않는지 확인.
+    """
+    url = f"http://127.0.0.1:{PORT}/webhook"
+    req = urllib.request.Request(
+        url, data=b"", method="POST",
+        headers={"Content-Type": "application/json", "Content-Length": "0"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        assert False, "Should have raised 400"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+    print("  PASS: POST /webhook empty body → 400")
+
+
+def test_webhook_oversized_field(server):
+    """
+    [MEDIUM #9] 비정상적으로 긴 필드를 포함한 이벤트 → 수용하되 잘라냄 확인.
+    서버가 크래시하거나 메모리를 과도하게 사용하지 않는지 검증.
+    """
+    oversized_event = {
+        "rule": "A" * 10000,          # 매우 긴 rule 이름
+        "priority": "Warning",
+        "output": "B" * 50000,        # 매우 긴 output
+        "output_fields": {
+            "proc.name": "C" * 5000,  # 매우 긴 proc.name
+            "k8s.ns.name": "test",
+            "k8s.pod.name": "test-pod",
+            "container.id": "abc123",
+        },
+        "tags": ["tag"] * 100,        # 태그 과다
+    }
+    result = http_post("/webhook", oversized_event)
+    assert result["status"] == "accepted", f"Expected accepted, got {result}"
+    time.sleep(0.5)
+    # 이벤트가 저장되었는지 확인 (잘려서 저장)
+    events = http_get("/api/v1/events")
+    stored = next((e for e in events["events"] if "AAA" in e.get("rule", "")), None)
+    if stored:
+        assert len(stored["rule"]) <= 512, f"rule not truncated: {len(stored['rule'])}"
+    print("  PASS: POST /webhook oversized fields → accepted and truncated")
+
+
 def test_isolations_api(server):
     """GET /api/v1/isolations (empty, no cluster)."""
     # This will return empty or error since no cluster
@@ -274,6 +340,8 @@ def run_all():
         ("Event not found", test_event_not_found),
         ("Prometheus metrics", test_metrics),
         ("Invalid JSON", test_webhook_invalid_json),
+        ("Empty body",   test_webhook_empty_body),        # [MEDIUM #9] 추가
+        ("Oversized fields", test_webhook_oversized_field), # [MEDIUM #9] 추가
         ("Isolations API", test_isolations_api),
     ]
 

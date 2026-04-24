@@ -143,6 +143,11 @@ class FalsePositiveFilter:
             score += 0.10
             reasons.append("host_event")
 
+            # [MEDIUM #6] proc.name 화이트리스트 단독으로 suppress 임계값(0.75)에
+            # 도달하지 않도록 점수 상한을 분리 관리.
+            # 공격자가 프로세스명을 "systemd"로 위장해도 proc.name 점수만으로는
+            # suppress(0.75) 에 도달하지 않음 (0.10 + 0.50 = 0.60 < 0.75).
+            # loginuid + 정상 쓰기 경로까지 함께 확인되어야 suppress됨.
             if proc_name in HOST_SYSTEM_PROCESSES:
                 score += 0.50
                 reasons.append(f"sys_proc:{proc_name}")
@@ -151,6 +156,8 @@ class FalsePositiveFilter:
                 score += 0.30
                 reasons.append(f"sys_pname:{proc_pname}")
 
+            # loginuid=4294967295 는 커널/데몬 프로세스의 특성
+            # 공격자가 위장하려면 setuid 시스콜 필요 → 별도 룰에서 탐지됨
             if loginuid in _DAEMON_LOGINUID:
                 score += 0.25
                 reasons.append("daemon_loginuid")

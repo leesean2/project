@@ -125,6 +125,15 @@ class HeartbeatMonitor:
             self._check_silence()
 
     def _check_silence(self) -> None:
+        """
+        [MEDIUM #7] Race Condition 수정:
+        기존 코드는 lock 안에서 상태를 읽은 뒤 lock 밖에서 상태를 변경했음.
+        → 읽기와 쓰기 사이에 다른 스레드가 상태를 바꾸면 불일치 발생.
+
+        수정: 상태 읽기 → 새 상태 계산 → 쓰기를 하나의 lock 블록 안에서 수행.
+        로그와 메트릭 업데이트만 lock 밖으로 분리 (I/O는 lock 밖이 원칙).
+        """
+        # 1단계: lock 안에서 현재 상태 스냅샷 + 새 상태 계산
         with self._lock:
             now = time.monotonic()
             event_age = now - self._last_event_time
@@ -133,44 +142,46 @@ class HeartbeatMonitor:
                 if self._last_watchdog_time is not None
                 else None
             )
+
+            # 이벤트 침묵 상태 계산
             prev_event_silenced = self._event_silenced
+            new_event_silenced = event_age > self._silence_threshold
+            self._event_silenced = new_event_silenced
+
+            # watchdog 침묵 상태 계산
             prev_watchdog_silenced = self._watchdog_silenced
+            new_watchdog_silenced = (
+                watchdog_age is not None
+                and watchdog_age > self._silence_threshold * 2
+            )
+            self._watchdog_silenced = new_watchdog_silenced
 
-        # --- 이벤트 스트림 침묵 감지 ---
-        if event_age > self._silence_threshold:
-            if not prev_event_silenced:
-                self._event_silenced = True
-                logger.critical(
-                    "FALCO SILENCE DETECTED: No events for %.0fs "
-                    "(threshold=%ds). Falco may be killed or compromised!",
-                    event_age,
-                    self._silence_threshold,
-                )
-                self._metrics.inc_falco_silence()
-                self._metrics.set_falco_silenced(True)
-            else:
-                logger.warning(
-                    "Falco still silent: %.0fs without events", event_age
-                )
-        else:
-            if prev_event_silenced:
-                self._event_silenced = False
-                logger.info("Falco event stream resumed after silence (%.0fs)", event_age)
-                self._metrics.set_falco_silenced(False)
+            # 메트릭 업데이트 (lock 안에서 gauge만 업데이트)
+            self._metrics.set_falco_last_event_age(event_age)
 
-        # --- watchdog heartbeat 침묵 감지 ---
-        # watchdog이 한 번도 오지 않은 경우(서버 막 시작)는 threshold 2배 유예
-        if watchdog_age is not None and watchdog_age > self._silence_threshold * 2:
-            if not prev_watchdog_silenced:
-                self._watchdog_silenced = True
-                logger.critical(
-                    "FALCO WATCHDOG MISSING: No watchdog heartbeat for %.0fs! "
-                    "Watchdog service may be stopped.",
-                    watchdog_age,
-                )
-        else:
-            if prev_watchdog_silenced and watchdog_age is not None:
-                self._watchdog_silenced = False
-                logger.info("Watchdog heartbeat resumed")
+        # 2단계: lock 밖에서 로그 + 카운터 메트릭 (I/O가 lock 안에 있으면 데드락 위험)
+        if new_event_silenced and not prev_event_silenced:
+            logger.critical(
+                "FALCO SILENCE DETECTED: No events for %.0fs "
+                "(threshold=%ds). Falco may be killed or compromised!",
+                event_age,
+                self._silence_threshold,
+            )
+            self._metrics.inc_falco_silence()
+            self._metrics.set_falco_silenced(True)
 
-        self._metrics.set_falco_last_event_age(event_age)
+        elif not new_event_silenced and prev_event_silenced:
+            logger.info("Falco event stream resumed after silence (%.0fs)", event_age)
+            self._metrics.set_falco_silenced(False)
+
+        elif new_event_silenced:
+            logger.warning("Falco still silent: %.0fs without events", event_age)
+
+        if new_watchdog_silenced and not prev_watchdog_silenced:
+            logger.critical(
+                "FALCO WATCHDOG MISSING: No watchdog heartbeat for %.0fs! "
+                "Watchdog service may be stopped.",
+                watchdog_age,
+            )
+        elif not new_watchdog_silenced and prev_watchdog_silenced:
+            logger.info("Watchdog heartbeat resumed")

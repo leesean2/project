@@ -11,6 +11,29 @@ Exposes metrics for:
 import threading
 import time
 
+# [MEDIUM #8] Prometheus label injection 방지
+# label 값에 큰따옴표, 역슬래시, 개행이 포함되면 exposition 포맷이 깨질 수 있음.
+# 허용: 큰따옴표/역슬래시 이스케이프, 개행 제거, 길이 상한 적용
+_LABEL_MAX_LEN = 128
+
+
+def _sanitize_label(value: str, max_len: int = _LABEL_MAX_LEN) -> str:
+    """
+    [MEDIUM #8] Prometheus text exposition label 값 정제.
+    - 개행(\\n, \\r) 제거
+    - 큰따옴표, 역슬래시 이스케이프
+    - max_len 초과 시 잘라냄
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    # 개행 제거
+    value = value.replace("\n", "").replace("\r", "")
+    # 길이 제한
+    value = value[:max_len]
+    # Prometheus exposition 이스케이프
+    value = value.replace("\\", "\\\\").replace('"', '\\"')
+    return value
+
 
 class MetricsStore:
     """Thread-safe Prometheus-format metrics store."""
@@ -129,20 +152,21 @@ class MetricsStore:
             lines.append("# HELP compliance_falco_events_by_rule_total Events by Falco rule")
             lines.append("# TYPE compliance_falco_events_by_rule_total counter")
             for rule, count in self.events_by_rule.items():
-                safe = rule.replace('"', '\\"')
+                safe = _sanitize_label(rule)  # [MEDIUM #8]
                 lines.append(f'compliance_falco_events_by_rule_total{{rule="{safe}"}} {count}')
 
             # --- Events by namespace ---
             lines.append("# HELP compliance_falco_events_by_namespace_total Events by namespace")
             lines.append("# TYPE compliance_falco_events_by_namespace_total counter")
             for ns, count in self.events_by_namespace.items():
-                lines.append(f'compliance_falco_events_by_namespace_total{{namespace="{ns}"}} {count}')
+                safe = _sanitize_label(ns)  # [MEDIUM #8]
+                lines.append(f'compliance_falco_events_by_namespace_total{{namespace="{safe}"}} {count}')
 
             # --- Actions ---
             lines.append("# HELP compliance_response_actions_total Response actions taken")
             lines.append("# TYPE compliance_response_actions_total counter")
             for action, count in self.actions_total.items():
-                safe = action.replace('"', '\\"')
+                safe = _sanitize_label(action)  # [MEDIUM #8]
                 lines.append(f'compliance_response_actions_total{{action="{safe}"}} {count}')
 
             # --- Isolation ---
@@ -192,7 +216,7 @@ class MetricsStore:
             lines.append("# HELP compliance_fp_suppressed_total Events suppressed as false positives by rule")
             lines.append("# TYPE compliance_fp_suppressed_total counter")
             for rule, count in self.fp_suppressed_by_rule.items():
-                safe = rule.replace('"', '\\"')
+                safe = _sanitize_label(rule)  # [MEDIUM #8]
                 lines.append(f'compliance_fp_suppressed_total{{rule="{safe}"}} {count}')
 
             lines.append("# HELP compliance_fp_downgraded_total Events with severity downgraded by FP filter")

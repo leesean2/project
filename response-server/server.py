@@ -22,39 +22,38 @@ from http.server import HTTPServer
 # --- Configuration ---
 CONFIG = {
     "port": int(os.getenv("SERVER_PORT", "5000")),
+    # [HIGH #1] 바인딩 주소를 환경변수로 분리.
+    # 프로덕션: "127.0.0.1" (ClusterIP 서비스가 앞단에서 받으므로 루프백으로 충분)
+    # 클러스터 내 Pod 간 통신이 필요한 경우만 "0.0.0.0" 으로 설정.
+    "bind_host": os.getenv("SERVER_BIND_HOST", "0.0.0.0"),
     "ai_endpoint": os.getenv("AI_ENDPOINT", ""),
     "ai_timeout": int(os.getenv("AI_TIMEOUT", "5")),
     "auto_isolate": os.getenv("AUTO_ISOLATE", "true").lower() == "true",
     "log_level": os.getenv("LOG_LEVEL", "INFO"),
     "event_store_size": int(os.getenv("EVENT_STORE_SIZE", "2000")),
     # ── False Positive 완화 임계값 ─────────────────────────
-    # fp_score >= suppress_threshold → action = fp_suppressed (log_only 강제)
     "fp_suppress_threshold": float(os.getenv("FP_SUPPRESS_THRESHOLD", "0.75")),
-    # fp_score >= downgrade_threshold → severity 한 단계 하향
     "fp_downgrade_threshold": float(os.getenv("FP_DOWNGRADE_THRESHOLD", "0.45")),
-    # AI confidence < threshold → fallback 분류기 사용
     "ai_confidence_threshold": float(os.getenv("AI_CONFIDENCE_THRESHOLD", "0.6")),
-    # Fallback confidence < threshold → severity 하향
     "fallback_confidence_threshold": float(os.getenv("FALLBACK_CONFIDENCE_THRESHOLD", "0.35")),
-    # Falco 침묵 탐지: N초 동안 이벤트 없으면 CRITICAL 경보
+    # ── Heartbeat ─────────────────────────────────────────
     "heartbeat_silence_threshold": int(os.getenv("HEARTBEAT_SILENCE_THRESHOLD", "90")),
-    # 침묵 감지 체크 주기 (초)
     "heartbeat_check_interval": int(os.getenv("HEARTBEAT_CHECK_INTERVAL", "30")),
     # ── Webhook 보안 ──────────────────────────────────────
-    # HMAC-SHA256 공유 비밀키 (signing proxy와 동일한 값 필요)
     "webhook_secret": os.getenv("WEBHOOK_SECRET", ""),
-    # True이면 서명 없는 요청 거부 (08-setup-signing-proxy.sh 실행 후 활성화)
     "webhook_hmac_required": os.getenv("WEBHOOK_HMAC_REQUIRED", "true").lower() == "true",
-    # 허용 소스 IP 목록 (콤마 구분, CIDR 지원). 빈 문자열이면 비활성화.
     "webhook_ip_whitelist": [
         ip.strip()
         for ip in os.getenv("WEBHOOK_IP_WHITELIST", "").split(",")
         if ip.strip()
     ],
-    # IP당 burst 허용 요청 수
     "rate_limit_capacity": int(os.getenv("RATE_LIMIT_CAPACITY", "100")),
-    # IP당 초당 토큰 충전 속도 (지속 RPS)
     "rate_limit_refill_rate": float(os.getenv("RATE_LIMIT_REFILL_RATE", "3.0")),
+    # ── REST API / Heartbeat 인증 ─────────────────────────
+    "api_token": os.getenv("API_TOKEN", ""),
+    "heartbeat_token": os.getenv("HEARTBEAT_TOKEN", ""),
+    # ── CORS ─────────────────────────────────────────────
+    "allowed_origins": os.getenv("ALLOWED_ORIGINS", "http://localhost:3000"),
 }
 
 # --- Logging ---
@@ -82,14 +81,35 @@ class AppServer(HTTPServer):
 
 
 def _validate_config(config: dict) -> None:
-    """시작 전 보안 필수 설정 검증. 치명적 오류 시 즉시 종료."""
+    """
+    시작 전 보안 필수 설정 검증. 치명적 오류 시 즉시 종료.
+
+    [HIGH #2] security 모듈 임포트 전에 설정값을 검증하여
+    잘못된 설정으로 security=None 상태로 서버가 시작되는 것을 방지.
+    """
+    # HMAC 설정 검증
     if config["webhook_hmac_required"] and not config["webhook_secret"]:
         logger.critical(
             "WEBHOOK_SECRET이 설정되지 않은 상태에서 WEBHOOK_HMAC_REQUIRED=true입니다. "
             "서버를 시작할 수 없습니다. "
-            "08-setup-signing-proxy.sh를 실행하거나 WEBHOOK_SECRET 환경변수를 설정하세요."
+            "WEBHOOK_SECRET 환경변수를 설정하세요."
         )
         sys.exit(1)
+
+    # [HIGH #2] API_TOKEN / HEARTBEAT_TOKEN 빈값 경고
+    # 빈값이면 http.py에서 503을 반환하지만, 시작 시점에도 명시적으로 경고
+    if not config["api_token"]:
+        logger.warning(
+            "API_TOKEN이 설정되지 않았습니다. "
+            "DELETE /api/v1/isolations 및 인증 API가 503을 반환합니다. "
+            "API_TOKEN 환경변수를 설정하세요."
+        )
+    if not config["heartbeat_token"]:
+        logger.warning(
+            "HEARTBEAT_TOKEN이 설정되지 않았습니다. "
+            "POST /api/v1/heartbeat 가 503을 반환합니다. "
+            "HEARTBEAT_TOKEN 환경변수를 설정하세요."
+        )
 
 
 def main():
@@ -106,7 +126,16 @@ def main():
     from core.processor import EventProcessor
     from k8s.client import KubeClient
     from handlers.http import RequestHandler
-    from middleware.security import WebhookSecurity
+
+    # [HIGH #2] security 모듈 임포트 실패 시 서버 시작 거부
+    try:
+        from middleware.security import WebhookSecurity
+    except ImportError as e:
+        logger.critical(
+            "보안 미들웨어(middleware.security) 임포트 실패: %s. "
+            "security=None 상태로 시작하지 않습니다. 서버를 종료합니다.", e
+        )
+        sys.exit(1)
 
     # --- Initialize components ---
     metrics = MetricsStore()
@@ -149,10 +178,10 @@ def main():
     logger.info("=" * 60)
     logger.info("Compliance Runtime Response Server")
     logger.info("=" * 60)
-    logger.info("  Webhook:      0.0.0.0:%d/webhook", CONFIG["port"])
-    logger.info("  Metrics:      0.0.0.0:%d/metrics", CONFIG["port"])
-    logger.info("  Events API:   0.0.0.0:%d/api/v1/events", CONFIG["port"])
-    logger.info("  Isolations:   0.0.0.0:%d/api/v1/isolations", CONFIG["port"])
+    logger.info("  Webhook:      %s:%d/webhook", CONFIG["bind_host"], CONFIG["port"])
+    logger.info("  Metrics:      %s:%d/metrics", CONFIG["bind_host"], CONFIG["port"])
+    logger.info("  Events API:   %s:%d/api/v1/events", CONFIG["bind_host"], CONFIG["port"])
+    logger.info("  Isolations:   %s:%d/api/v1/isolations", CONFIG["bind_host"], CONFIG["port"])
     logger.info("  AI endpoint:  %s", CONFIG["ai_endpoint"] or "(fallback mode)")
     logger.info("  Auto-isolate: %s", CONFIG["auto_isolate"])
     logger.info(
@@ -193,7 +222,7 @@ def main():
 
     # --- Start server ---
     server = AppServer(
-        ("0.0.0.0", CONFIG["port"]),
+        (CONFIG["bind_host"], CONFIG["port"]),
         RequestHandler,
         processor=processor,
         store=store,
