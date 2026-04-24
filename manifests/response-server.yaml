@@ -89,19 +89,35 @@ data:
   HEARTBEAT_CHECK_INTERVAL: "30"
   # ── Webhook 보안 설정 ─────────────────────────────────
   # WEBHOOK_SECRET은 별도 Secret 오브젝트에서 주입 (아래 webhook-secret 참조)
-  # True이면 HMAC 없는 요청 거부 (08-setup-signing-proxy.sh 실행 후 "true"로 변경)
-  WEBHOOK_HMAC_REQUIRED: "false"
+  # HMAC 서명 없는 요청을 거부 (Hard Mode)
+  WEBHOOK_HMAC_REQUIRED: "true"
   # 허용 소스 IP (CIDR 가능). 서명 프록시가 X-Forwarded-For: 127.0.0.1 추가.
   WEBHOOK_IP_WHITELIST: "127.0.0.1,::1"
   # IP당 burst 허용 요청 수 (토큰 버킷 초기 용량)
   RATE_LIMIT_CAPACITY: "100"
   # IP당 초당 토큰 충전 속도 (지속 허용 RPS)
   RATE_LIMIT_REFILL_RATE: "3.0"
+  # ── REST API / Heartbeat 인증 설정 ───────────────────
+  # [HIGH #6] CORS 허용 오리진 (쉼표 구분). 와일드카드(*) 대신 명시적 오리진만 허용.
+  # Grafana 대시보드 주소로 변경할 것.
+  ALLOWED_ORIGINS: "http://localhost:3000"
 
 ---
-# Webhook HMAC 비밀키 Secret
-# 실제 값은 08-setup-signing-proxy.sh 에서 자동 생성 후 kubectl로 주입됨
-# 이 파일의 WEBHOOK_SECRET은 빈 값 placeholder — 절대 커밋하지 말 것
+# =============================================================
+# 인증 Secret — 모든 토큰은 배포 전 반드시 실제 값으로 주입할 것
+# 절대 이 파일에 실제 값을 커밋하지 말 것 (.gitignore에 추가 권장)
+#
+# 생성 명령:
+#   kubectl create secret generic webhook-secret \
+#     --from-literal=WEBHOOK_SECRET=$(openssl rand -hex 32) \
+#     --from-literal=HEARTBEAT_TOKEN=$(openssl rand -hex 32) \
+#     --from-literal=API_TOKEN=$(openssl rand -hex 32) \
+#     -n compliance-system --dry-run=client -o yaml | kubectl apply -f -
+#
+# [CRITICAL #2] WEBHOOK_SECRET이 빈 값이면 서버 시작 시 503 반환
+# [HIGH #4]     HEARTBEAT_TOKEN이 빈 값이면 heartbeat 엔드포인트 503 반환
+# [HIGH #5]     API_TOKEN이 빈 값이면 DELETE /api/v1/isolations 503 반환
+# =============================================================
 apiVersion: v1
 kind: Secret
 metadata:
@@ -112,7 +128,12 @@ metadata:
     app.kubernetes.io/part-of: compliance-platform
 type: Opaque
 stringData:
-  WEBHOOK_SECRET: ""
+  # Falco Sidekick → Response Server HMAC 서명 검증 키
+  WEBHOOK_SECRET: ""        # 반드시 실제 값으로 교체 (openssl rand -hex 32)
+  # POST /api/v1/heartbeat X-Watchdog-Token 인증 토큰
+  HEARTBEAT_TOKEN: ""       # 반드시 실제 값으로 교체 (openssl rand -hex 32)
+  # DELETE /api/v1/isolations Bearer 인증 토큰
+  API_TOKEN: ""             # 반드시 실제 값으로 교체 (openssl rand -hex 32)
 
 ---
 # Deployment
@@ -200,22 +221,6 @@ spec:
       targetPort: http
       protocol: TCP
 
----
-# NodePort for debugging (optional, remove in production)
-apiVersion: v1
-kind: Service
-metadata:
-  name: response-server-debug
-  namespace: compliance-system
-  labels:
-    app: response-server
-spec:
-  type: NodePort
-  selector:
-    app: response-server
-  ports:
-    - name: http
-      port: 5000
-      targetPort: http
-      nodePort: 30500
-      protocol: TCP
+# NodePort debug service는 제거됨 — 외부 접근이 필요한 경우
+# kubectl port-forward 를 사용할 것:
+#   kubectl port-forward -n compliance-system svc/response-server 5000:5000

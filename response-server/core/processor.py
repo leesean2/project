@@ -5,6 +5,7 @@ FalcoEvent → Classify → Differential Response → Store → Metrics
 """
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -227,13 +228,26 @@ class EventProcessor:
         If K8s namespace/pod are missing but container_id is present,
         resolve via K8s API. This handles host-mode Falco where K8s
         metadata enrichment doesn't work automatically.
+
+        [MEDIUM #8] container_id 형식 검증:
+          - 영숫자(소문자 hex) 12~64자만 허용
+          - 형식 불일치 시 K8s API 호출 없이 즉시 반환
+          - 비정상적으로 긴 ID로 캐시 오염 및 K8s API 남용 방지
         """
         # Skip if already has K8s info
         if event.k8s.namespace and event.k8s.pod_name:
             return
 
         container_id = event.k8s.container_id
-        if not container_id or container_id == "host":
+        if not container_id or container_id in ("host", "<NA>"):
+            return
+
+        # [MEDIUM #8] container_id 형식 검증 — hex 12~64자
+        if not re.match(r'^[a-f0-9]{12,64}$', container_id):
+            logger.debug(
+                "Skipping metadata enrichment: invalid container_id format '%s'",
+                container_id[:20],  # 로그에도 일부만 출력
+            )
             return
 
         pod_info = self.kube.resolve_container_to_pod(container_id)

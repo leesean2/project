@@ -329,6 +329,12 @@ falcosidekick:
       address: "http://response-server.compliance-system.svc.cluster.local:5000/webhook"
       method: "POST"
       minimumpriority: "notice"
+      # [LOW #10] HMAC 서명 헤더 추가 — Response Server의 HMAC Hard Mode와 쌍을 이룸.
+      # WEBHOOK_SECRET 값은 배포 스크립트(08-setup-signing-proxy.sh)에서
+      # kubectl create secret 으로 주입되며, 여기서는 환경변수 참조만 선언.
+      # Sidekick이 X-Falco-Signature 헤더를 포함하지 않으면
+      # Response Server가 WEBHOOK_HMAC_REQUIRED=true 설정에 의해 401 거부.
+      customHeaders: "X-Falco-Signature=$(WEBHOOK_SECRET)"
 
   # Prometheus exporter for Sidekick metrics
   # -> Falco event count by priority, rule, etc.

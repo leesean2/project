@@ -10,6 +10,7 @@ Handles:
 import json
 import logging
 import ssl
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -25,6 +26,10 @@ SYSTEM_NAMESPACES = frozenset({
     "gatekeeper-system",
 })
 
+# [LOW #11] Service Account 토큰 캐시 TTL (초)
+# K8s SA 토큰은 기본 1시간마다 갱신되므로 55분(3300초)마다 재읽기
+_TOKEN_TTL: int = 3300
+
 
 class KubeClient:
     """Kubernetes API client using in-cluster service account."""
@@ -35,14 +40,29 @@ class KubeClient:
         self.ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
         self._token: Optional[str] = None
         self._ssl_ctx: Optional[ssl.SSLContext] = None
+        # [LOW #11] 토큰 만료 추적
+        self._token_fetched_at: float = 0.0
+        # [MEDIUM #9] 컨테이너 캐시 Race Condition 방지 Lock
+        self._cache_lock = threading.Lock()
+        self._container_cache: dict = {}
+        self._cache_timestamp: float = 0.0
 
     # ─── Internal Helpers ─────────────────────────────────
 
     def _get_token(self) -> str:
-        if self._token is None:
+        """
+        [LOW #11] Service Account 토큰 TTL 기반 갱신.
+
+        K8s SA 토큰은 기본 1시간마다 교체되므로 _TOKEN_TTL(3300초)마다
+        파일을 다시 읽어 만료된 토큰으로 인한 K8s API 인증 실패를 방지.
+        """
+        now = time.time()
+        if self._token is None or (now - self._token_fetched_at) > _TOKEN_TTL:
             try:
                 with open(self.token_path) as f:
                     self._token = f.read().strip()
+                self._token_fetched_at = now
+                logger.debug("Service account token refreshed")
             except FileNotFoundError:
                 logger.warning("No service account token found (outside cluster?)")
                 self._token = ""
@@ -234,46 +254,68 @@ class KubeClient:
         Searches all pods across all namespaces.
         Returns {"namespace": ..., "pod_name": ..., "labels": ...} or empty dict.
 
-        Uses a cache to avoid hammering the API on every event.
+        [MEDIUM #9] _cache_lock으로 캐시 읽기/쓰기를 보호하여
+        멀티스레드(webhook 비동기 처리) 환경의 Race Condition 방지.
+        캐시 초기화와 갱신 모두 락 안에서 수행.
         """
         if not container_id or container_id in ("host", "<NA>"):
             return {}
 
-        # Check cache first
-        if not hasattr(self, '_container_cache'):
-            self._container_cache = {}       # container_id -> {ns, pod, labels}
-            self._cache_timestamp = 0
-
-        # Refresh cache every 30 seconds
         now = time.time()
-        if now - self._cache_timestamp > 30:
-            self._refresh_container_cache()
-            self._cache_timestamp = now
 
-        # Short container IDs: Falco often gives 12-char prefix
-        for cached_id, info in self._container_cache.items():
-            if cached_id.startswith(container_id) or container_id.startswith(cached_id):
-                return info
+        with self._cache_lock:
+            # 캐시 만료 시 갱신 (락 안에서 수행하여 중복 갱신 방지)
+            if now - self._cache_timestamp > 30:
+                self._refresh_container_cache_locked()
+                self._cache_timestamp = now
 
-        # Cache miss — force refresh once
-        if now - self._cache_timestamp > 2:
-            self._refresh_container_cache()
-            self._cache_timestamp = now
-            for cached_id, info in self._container_cache.items():
-                if cached_id.startswith(container_id) or container_id.startswith(cached_id):
-                    return info
+            # Short container IDs: Falco often gives 12-char prefix
+            result = self._lookup_cache_locked(container_id)
+            if result:
+                return result
+
+        # 캐시 미스 — 락 밖에서 잠깐 대기 후 1회 강제 갱신
+        # (다른 스레드의 갱신과 중복될 수 있으나 락으로 내부 보호됨)
+        with self._cache_lock:
+            if now - self._cache_timestamp > 2:
+                self._refresh_container_cache_locked()
+                self._cache_timestamp = now
+            result = self._lookup_cache_locked(container_id)
+            if result:
+                return result
 
         logger.debug("Container %s not found in any pod", container_id)
         return {}
 
+    def _lookup_cache_locked(self, container_id: str) -> dict:
+        """
+        캐시에서 container_id 조회. 반드시 _cache_lock 보유 상태에서 호출.
+        12자 prefix 매칭 지원 (Falco short ID 대응).
+        """
+        for cached_id, info in self._container_cache.items():
+            if cached_id.startswith(container_id) or container_id.startswith(cached_id):
+                return info
+        return {}
+
+    def _refresh_container_cache_locked(self):
+        """
+        전체 Pod 목록을 조회해 container_id → pod 매핑 캐시 재구성.
+        반드시 _cache_lock 보유 상태에서 호출.
+        """
+        self._refresh_container_cache()
+
     def _refresh_container_cache(self):
-        """Fetch all pods and build container_id → pod mapping."""
+        """
+        Fetch all pods and build container_id → pod mapping.
+        [MEDIUM #9] 새 캐시를 로컬에 빌드한 뒤 한 번에 교체하여
+        부분 갱신 중 다른 스레드가 불완전한 캐시를 읽는 것을 방지.
+        """
         url = f"{self.api_server}/api/v1/pods"
         result = self._request("GET", url, timeout=10)
         if not result or "items" not in result:
             return
 
-        cache = {}
+        new_cache = {}
         for pod in result["items"]:
             metadata = pod.get("metadata", {})
             ns = metadata.get("namespace", "")
@@ -288,7 +330,7 @@ class KubeClient:
                 if "://" in cid:
                     cid = cid.split("://", 1)[1]
                 if cid:
-                    cache[cid] = {
+                    new_cache[cid] = {
                         "namespace": ns,
                         "pod_name": pod_name,
                         "labels": labels,
@@ -302,7 +344,7 @@ class KubeClient:
                 if "://" in cid:
                     cid = cid.split("://", 1)[1]
                 if cid:
-                    cache[cid] = {
+                    new_cache[cid] = {
                         "namespace": ns,
                         "pod_name": pod_name,
                         "labels": labels,
@@ -310,8 +352,9 @@ class KubeClient:
                         "image": cs.get("image", ""),
                     }
 
-        self._container_cache = cache
-        logger.debug("Container cache refreshed: %d containers", len(cache))
+        # 한 번에 교체 (atomic assignment in CPython GIL 보장)
+        self._container_cache = new_cache
+        logger.debug("Container cache refreshed: %d containers", len(new_cache))
 
     def is_in_cluster(self) -> bool:
         """Check if running inside a Kubernetes cluster."""
