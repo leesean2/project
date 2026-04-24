@@ -80,15 +80,16 @@ class AppServer(HTTPServer):
         self.heartbeat = heartbeat
         self.security = security
 
-    def _validate_config(config: dict) -> None:
-        """시작 전 보안 필수 설정 검증. 치명적 오류 시 즉시 종료."""
-        if config["webhook_hmac_required"] and not config["webhook_secret"]:
-            logger.critical(
-                "WEBHOOK_SECRET이 설정되지 않은 상태에서 WEBHOOK_HMAC_REQUIRED=true입니다. "
-                "서버를 시작할 수 없습니다. "
-                "08-setup-signing-proxy.sh를 실행하거나 WEBHOOK_SECRET 환경변수를 설정하세요."
-            )
-            sys.exit(1)
+
+def _validate_config(config: dict) -> None:
+    """시작 전 보안 필수 설정 검증. 치명적 오류 시 즉시 종료."""
+    if config["webhook_hmac_required"] and not config["webhook_secret"]:
+        logger.critical(
+            "WEBHOOK_SECRET이 설정되지 않은 상태에서 WEBHOOK_HMAC_REQUIRED=true입니다. "
+            "서버를 시작할 수 없습니다. "
+            "08-setup-signing-proxy.sh를 실행하거나 WEBHOOK_SECRET 환경변수를 설정하세요."
+        )
+        sys.exit(1)
 
 
 def main():
