@@ -415,8 +415,10 @@ def test_event_store_add_get():
     id1 = store.add(r1)
     id2 = store.add(r2)
 
-    assert id1 == "evt-000001"
-    assert id2 == "evt-000002"
+    # [BUG FIX] UUID 기반 ID 검증 — "evt-<uuid.hex>" 형식
+    assert id1.startswith("evt-"), f"Expected 'evt-' prefix, got {id1!r}"
+    assert id2.startswith("evt-"), f"Expected 'evt-' prefix, got {id2!r}"
+    assert id1 != id2, "IDs must be unique"
     assert store.count() == 2
 
     # Get by ID

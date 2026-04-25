@@ -26,6 +26,11 @@ _SIG_HEADER = "X-Webhook-Signature"
 _TS_HEADER = "X-Webhook-Timestamp"
 _TIMESTAMP_MAX_SKEW = 300   # 5분 이내 타임스탬프만 허용 (replay 방지)
 
+# [HIGH] X-Forwarded-For를 신뢰할 로컬 프록시 주소
+# 서명 프록시(falco-signing-proxy)는 127.0.0.1에서 실행되므로 이 주소만 신뢰.
+# 외부 클라이언트가 XFF 헤더를 위조하여 IP 화이트리스트를 우회하는 것을 방지.
+_TRUSTED_PROXY_IPS: frozenset = frozenset({"127.0.0.1", "::1"})
+
 
 # ─── 토큰 버킷 ────────────────────────────────────────────
 
@@ -100,6 +105,9 @@ class WebhookSecurity:
         self._buckets_lock = threading.Lock()
         self._rl_capacity = rate_limit_capacity
         self._rl_refill = rate_limit_refill_rate
+        # [HIGH] 버킷 수 상한 — 무제한 성장으로 인한 메모리 소진 방지
+        # 상한 초과 시 새 IP를 즉시 거부(429)하여 DoS 공격에 대응
+        self._rl_max_buckets: int = 20_000
 
         self._whitelist: List[
             ipaddress.IPv4Network | ipaddress.IPv6Network
@@ -203,15 +211,22 @@ class WebhookSecurity:
     def _extract_client_ip(self, remote_addr: str, headers: Dict[str, str]) -> str:
         """
         실제 클라이언트 IP 추출.
-        서명 프록시가 X-Forwarded-For: 127.0.0.1 을 추가하므로 이를 우선.
+
+        [HIGH] X-Forwarded-For 스푸핑 방지:
+          XFF 헤더는 실제 연결이 신뢰된 프록시(_TRUSTED_PROXY_IPS)에서 온 경우에만 신뢰.
+          외부 클라이언트가 XFF: 127.0.0.1을 위조하여 IP 화이트리스트를 우회하는 것을 방지.
         """
-        xff = headers.get("X-Forwarded-For", "").split(",")[0].strip()
-        if xff:
-            return xff
-        # remote_addr 에서 포트 제거 ("127.0.0.1:12345" → "127.0.0.1")
-        addr = remote_addr.strip()
+        direct_ip = self._strip_port(remote_addr)
+        if direct_ip in _TRUSTED_PROXY_IPS:
+            xff = headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            if xff:
+                return xff
+        return direct_ip
+
+    def _strip_port(self, addr: str) -> str:
+        """remote_addr에서 포트 제거 ("127.0.0.1:12345" → "127.0.0.1", "[::1]:80" → "::1")."""
+        addr = addr.strip()
         if addr.startswith("["):
-            # IPv6: "[::1]:12345"
             bracket_end = addr.find("]")
             if bracket_end != -1:
                 return addr[1:bracket_end]
@@ -230,6 +245,13 @@ class WebhookSecurity:
     def _check_rate_limit(self, ip: str) -> bool:
         with self._buckets_lock:
             if ip not in self._buckets:
+                # [HIGH] 버킷 수 상한 초과 시 새 IP 거부 — 메모리 소진 방지
+                if len(self._buckets) >= self._rl_max_buckets:
+                    logger.warning(
+                        "Rate limit bucket capacity reached (%d), rejecting new IP",
+                        self._rl_max_buckets,
+                    )
+                    return False
                 self._buckets[ip] = _TokenBucket(
                     self._rl_capacity, self._rl_refill
                 )

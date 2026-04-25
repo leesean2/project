@@ -56,10 +56,17 @@ _ALLOWED_ORIGINS: list[str] = [
 # GET /api/v1/events?limit 최대 허용값
 _MAX_EVENT_LIMIT: int = 500
 
+# [CRITICAL] 요청 바디 최대 허용 크기 — 무제한 읽기로 인한 메모리 소진 DoS 방지
+_MAX_WEBHOOK_BODY_BYTES: int = 1 * 1024 * 1024   # 1 MB
+_MAX_HEARTBEAT_BODY_BYTES: int = 64 * 1024        # 64 KB
+
 # ─── 공개 읽기 API 속도 제한 (토큰 버킷, IP당) ──────────────────
 # burst: 최대 순간 요청 수, refill: 초당 충전 속도
 _READ_RL_BURST: int = int(os.environ.get("READ_RATE_LIMIT_BURST", "30"))
 _READ_RL_REFILL: float = float(os.environ.get("READ_RATE_LIMIT_REFILL", "1.0"))
+
+
+_READ_RL_MAX_BUCKETS: int = 20_000
 
 
 class _ReadRateLimiter:
@@ -74,8 +81,15 @@ class _ReadRateLimiter:
     def is_allowed(self, ip: str) -> bool:
         now = time.monotonic()
         with self._lock:
-            tokens, last = self._buckets.get(ip, (self._capacity, now))
-            tokens = min(self._capacity, tokens + (now - last) * self._refill)
+            if ip in self._buckets:
+                tokens, last = self._buckets[ip]
+                tokens = min(self._capacity, tokens + (now - last) * self._refill)
+            else:
+                # [HIGH] 버킷 수 상한 초과 시 새 IP 거부 — 메모리 소진 방지
+                if len(self._buckets) >= _READ_RL_MAX_BUCKETS:
+                    return False
+                tokens = self._capacity
+
             if tokens >= 1.0:
                 self._buckets[ip] = (tokens - 1.0, now)
                 return True
@@ -270,6 +284,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             if content_length == 0:
                 self._send_json(400, {"error": "empty body"})
                 return
+            # [CRITICAL] 바디 크기 상한 — 메모리 소진 DoS 방지
+            if content_length > _MAX_WEBHOOK_BODY_BYTES:
+                self._send_json(413, {"error": "request body too large"})
+                return
 
             body = self.rfile.read(content_length)
 
@@ -327,6 +345,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # [LOW] 보안 헤더 — MIME 스니핑·클릭재킹·캐시 노출 방지
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -440,6 +462,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get("Content-Length", 0))
             body = {}
+            if content_length > _MAX_HEARTBEAT_BODY_BYTES:
+                # [CRITICAL] 인증 후에도 과도한 바디 크기 거부
+                self._send_json(413, {"error": "request body too large"})
+                return
             if content_length > 0:
                 raw = self.rfile.read(content_length)
                 body = json.loads(raw.decode("utf-8"))
