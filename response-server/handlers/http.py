@@ -234,6 +234,39 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         return True
 
+    def _check_read_api_auth(self) -> bool:
+        """
+        [HIGH] GET /api/v1/* 읽기 엔드포인트 조건부 인증.
+
+        보안 이벤트 텔레메트리(명령어, 사용자, 네임스페이스, Pod 정보 등)는
+        민감 정보이므로 API_TOKEN이 설정된 환경에서는 Bearer 인증을 요구.
+        API_TOKEN이 비어있으면 개발/테스트 환경으로 간주하여 인증 생략(기존 동작 유지).
+
+        프로덕션 ConfigMap은 API_TOKEN 설정을 강제하므로 자동으로 보호 활성화됨.
+        """
+        if not _API_TOKEN:
+            return True  # 개발 모드 — 인증 없이 허용
+
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            logger.warning(
+                "Read API auth failed: missing Bearer token from %s",
+                self._client_ip(),
+            )
+            self._send_json(401, {"error": "unauthorized: Bearer token required"})
+            return False
+
+        provided_token = auth_header[len("Bearer "):]
+        if not _constant_time_eq(provided_token, _API_TOKEN):
+            logger.warning(
+                "Read API auth failed: invalid token from %s",
+                self._client_ip(),
+            )
+            self._send_json(401, {"error": "unauthorized: invalid token"})
+            return False
+
+        return True
+
     def _check_heartbeat_auth(self) -> bool:
         """
         [HIGH #4] Heartbeat 전용 토큰 인증.
@@ -361,6 +394,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         [MEDIUM #7] limit 파라미터 최대값 _MAX_EVENT_LIMIT(500)으로 제한.
         음수 또는 비정수 값은 기본값(50)으로 대체.
         """
+        if not self._check_read_api_auth():
+            return
         if not self._check_read_rate():
             return
         params = parse_qs(urlparse(self.path).query)
@@ -392,6 +427,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _handle_event_summary(self):
         """GET /api/v1/events/summary — dashboard aggregation."""
+        if not self._check_read_api_auth():
+            return
         if not self._check_read_rate():
             return
         summary = self.server.store.get_summary()
@@ -399,6 +436,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _handle_get_event(self, event_id: str):
         """GET /api/v1/events/:id"""
+        if not self._check_read_api_auth():
+            return
         if not self._check_read_rate():
             return
         event = self.server.store.get_by_id(event_id)
@@ -413,6 +452,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         """
         GET /api/v1/isolations?namespace=test-workloads
         """
+        if not self._check_read_api_auth():
+            return
         if not self._check_read_rate():
             return
         params = parse_qs(urlparse(self.path).query)
@@ -470,8 +511,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 raw = self.rfile.read(content_length)
                 body = json.loads(raw.decode("utf-8"))
 
-            falco_status = body.get("falco_status", "unknown")
-            source = body.get("source", "unknown")
+            # [MEDIUM] falco_status는 GET /api/v1/falco/status 응답에 반사되므로
+            # 길이/타입 검증을 통해 응답 오염·UI 렌더링 시 잠재적 XSS·로그 오염 방지
+            raw_status = body.get("falco_status", "unknown")
+            if not isinstance(raw_status, str):
+                raw_status = "unknown"
+            falco_status = raw_status[:32] or "unknown"
+
+            raw_source = body.get("source", "unknown")
+            if not isinstance(raw_source, str):
+                raw_source = "unknown"
+            source = raw_source[:64] or "unknown"
 
             heartbeat = getattr(self.server, "heartbeat", None)
             if heartbeat:
@@ -495,7 +545,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         """
         GET /api/v1/falco/status — Falco heartbeat 및 침묵 탐지 상태 조회.
         Prometheus 외에 REST로도 확인 가능한 엔드포인트.
+
+        [HIGH] 인증 + 속도 제한 추가:
+          - 인증 없이 접근 시 사용자 입력(falco_status)이 반사되어 정보 누출 가능
+          - 무제한 호출 시 DoS 벡터
         """
+        if not self._check_read_api_auth():
+            return
+        if not self._check_read_rate():
+            return
+
         heartbeat = getattr(self.server, "heartbeat", None)
         if heartbeat is None:
             self._send_json(503, {"error": "heartbeat monitor not initialized"})
