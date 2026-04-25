@@ -213,6 +213,10 @@ class KubeClient:
         """List all auto-isolation NetworkPolicies."""
         label_selector = "managed-by=compliance-response-server"
         if namespace:
+            # [HIGH] URL 경로 주입 방지 — 쿼리 파라미터 namespace는 사용자 입력
+            if not _valid_k8s_namespace(namespace):
+                logger.warning("Invalid namespace for list: %r", namespace[:64])
+                return []
             url = (f"{self.api_server}/apis/networking.k8s.io/v1"
                    f"/namespaces/{namespace}/networkpolicies"
                    f"?labelSelector={label_selector}")
