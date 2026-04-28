@@ -1,0 +1,448 @@
+{
+  "annotations": { "list": [] },
+  "description": "Policy-as-Code Compliance Platform — Runtime Detection Dashboard",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Runtime Compliance Score",
+      "description": "Overall compliance based on high-severity event rate",
+      "type": "gauge",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "100 - (compliance_falco_events_total{severity=\"high\"} / (compliance_falco_events_total{severity=\"high\"} + compliance_falco_events_total{severity=\"medium\"} + compliance_falco_events_total{severity=\"low\"} + 1) * 100)",
+          "legendFormat": "Score"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 70 },
+              { "color": "yellow", "value": 85 },
+              { "color": "green", "value": 95 }
+            ]
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        }
+      }
+    },
+    {
+      "title": "Total Events",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(compliance_falco_events_total)",
+          "legendFormat": "Total"
+        }
+      ],
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" } } }
+    },
+    {
+      "title": "HIGH Events",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 9, "y": 0 },
+      "targets": [
+        {
+          "expr": "compliance_falco_events_total{severity=\"high\"}",
+          "legendFormat": "High"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Auto-Isolations",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "compliance_network_isolations_total",
+          "legendFormat": "Isolated"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "AI Fallback Rate",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 15, "y": 0 },
+      "targets": [
+        {
+          "expr": "compliance_ai_fallbacks_total / (compliance_ai_requests_total + 1) * 100",
+          "legendFormat": "Fallback %"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "title": "Isolation Errors",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 6, "y": 3 },
+      "targets": [
+        {
+          "expr": "compliance_network_isolation_errors_total",
+          "legendFormat": "Errors"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Server Uptime",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 3, "x": 9, "y": 3 },
+      "targets": [
+        {
+          "expr": "compliance_server_uptime_seconds",
+          "legendFormat": "Uptime"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "title": "Events by Severity Over Time",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "rate(compliance_falco_events_total{severity=\"high\"}[5m])",
+          "legendFormat": "High"
+        },
+        {
+          "expr": "rate(compliance_falco_events_total{severity=\"medium\"}[5m])",
+          "legendFormat": "Medium"
+        },
+        {
+          "expr": "rate(compliance_falco_events_total{severity=\"low\"}[5m])",
+          "legendFormat": "Low"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "High" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Medium" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Low" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] }
+        ]
+      }
+    },
+    {
+      "title": "Events by Rule",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "topk(10, compliance_falco_events_by_rule_total)",
+          "legendFormat": "{{rule}}"
+        }
+      ]
+    },
+    {
+      "title": "Events by Namespace",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 14 },
+      "targets": [
+        {
+          "expr": "compliance_falco_events_by_namespace_total",
+          "legendFormat": "{{namespace}}"
+        }
+      ]
+    },
+    {
+      "title": "Response Actions Distribution",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 14 },
+      "targets": [
+        {
+          "expr": "compliance_response_actions_total",
+          "legendFormat": "{{action}}"
+        }
+      ]
+    },
+    {
+      "title": "AI Classification Latency",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "expr": "rate(compliance_ai_latency_seconds_bucket[5m])",
+          "legendFormat": "{{le}}"
+        }
+      ]
+    },
+    {
+      "title": "Auto-Isolation Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 14 },
+      "targets": [
+        {
+          "expr": "rate(compliance_network_isolations_total[5m])",
+          "legendFormat": "Isolations/sec"
+        },
+        {
+          "expr": "rate(compliance_network_isolation_errors_total[5m])",
+          "legendFormat": "Errors/sec"
+        }
+      ]
+    },
+    {
+      "title": "ISMS-P Compliance Status",
+      "description": "Maps Falco rules to ISMS-P regulation items",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
+      "targets": [
+        {
+          "expr": "compliance_falco_events_by_rule_total",
+          "legendFormat": "{{rule}}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "renameByName": { "rule": "Falco Rule", "Value": "Total Events" } } }
+      ]
+    },
+
+    {
+      "title": "Webhook Security",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 }
+    },
+
+    {
+      "title": "HMAC Mode",
+      "description": "1 = hard(필수), 0 = soft(선택). 프로덕션에서는 반드시 1이어야 합니다.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 31 },
+      "targets": [
+        {
+          "expr": "compliance_hmac_mode",
+          "legendFormat": "{{mode}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "SOFT (취약)", "color": "red" }, "1": { "text": "HARD (안전)", "color": "green" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "auto", "textMode": "value_and_name", "colorMode": "background" }
+    },
+
+    {
+      "title": "총 거부 요청 수",
+      "description": "보안 미들웨어가 차단한 웹훅 요청 누적 수",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 31 },
+      "targets": [
+        {
+          "expr": "sum(compliance_webhook_rejected_by_reason_total)",
+          "legendFormat": "Rejected"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 10 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" }
+    },
+
+    {
+      "title": "HMAC 인증 실패 수",
+      "description": "서명 불일치 또는 타임스탬프 초과로 거부된 요청",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 31 },
+      "targets": [
+        {
+          "expr": "compliance_webhook_rejected_by_reason_total{reason=\"hmac_failed\"}",
+          "legendFormat": "HMAC 실패"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" }
+    },
+
+    {
+      "title": "IP 차단 / Rate Limit",
+      "description": "IP 화이트리스트 차단(403) 및 속도 초과(429) 요청",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 31 },
+      "targets": [
+        {
+          "expr": "compliance_webhook_rejected_by_reason_total{reason=\"ip_blocked\"} + compliance_webhook_rejected_by_reason_total{reason=\"rate_limited\"}",
+          "legendFormat": "IP차단+속도초과"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" }
+    },
+
+    {
+      "title": "바디 크기 초과 (DoS 시도)",
+      "description": "1MB 상한을 초과한 요청 (HMAC 검증 전 조기 차단)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 31 },
+      "targets": [
+        {
+          "expr": "compliance_webhook_rejected_by_reason_total{reason=\"body_too_large\"}",
+          "legendFormat": "바디 초과"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" }
+    },
+
+    {
+      "title": "사유별 거부 건수 (누적)",
+      "description": "보안 사유별 거부 요청 분포",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 35 },
+      "targets": [
+        {
+          "expr": "compliance_webhook_rejected_by_reason_total",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "hmac_failed" },    "properties": [{ "id": "color", "value": { "fixedColor": "red",    "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "ip_blocked" },     "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "rate_limited" },   "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "body_too_large" }, "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }] }
+        ]
+      },
+      "options": { "pieType": "donut", "displayLabels": ["name", "percent"] }
+    },
+
+    {
+      "title": "웹훅 거부 시계열 (사유별 초당 발생률)",
+      "description": "공격 패턴 추적 — 급격한 증가는 진행 중인 공격을 의미",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 18, "x": 6, "y": 35 },
+      "targets": [
+        {
+          "expr": "rate(compliance_webhook_rejected_by_reason_total{reason=\"hmac_failed\"}[2m])",
+          "legendFormat": "HMAC 실패"
+        },
+        {
+          "expr": "rate(compliance_webhook_rejected_by_reason_total{reason=\"ip_blocked\"}[2m])",
+          "legendFormat": "IP 차단"
+        },
+        {
+          "expr": "rate(compliance_webhook_rejected_by_reason_total{reason=\"rate_limited\"}[2m])",
+          "legendFormat": "Rate Limit"
+        },
+        {
+          "expr": "rate(compliance_webhook_rejected_by_reason_total{reason=\"body_too_large\"}[2m])",
+          "legendFormat": "바디 초과"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "min": 0 },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "HMAC 실패" },  "properties": [{ "id": "color", "value": { "fixedColor": "red",    "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "IP 차단" },    "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "Rate Limit" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "바디 초과" },  "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum", "max"] } }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["compliance", "falco", "runtime", "isms-p"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Runtime Detection — Compliance Dashboard",
+  "uid": "compliance-runtime-detection",
+  "version": 1
+}

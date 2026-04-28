@@ -1,0 +1,231 @@
+# =============================================================
+# Falco Watchdog DaemonSet
+# =============================================================
+# 목적: Falco 탐지 파이프라인 생존 여부를 두 경로로 검증한다.
+#
+# 경로 1 — Falco Canary (파이프라인 전체 테스트):
+#   touch /var/run/falco-heartbeat (proc.name=touch)
+#   → Falco Heartbeat Canary 룰 발화
+#   → Sidekick → signing-proxy → Response Server /webhook
+#
+# 경로 2 — 직접 Heartbeat (Falco 프로세스 생존 확인):
+#   POST response-server:5000/api/v1/heartbeat
+#   → HeartbeatMonitor.record_watchdog() 갱신
+#
+# 보안 노트:
+#   runAsUser: 0 — 호스트 /var/run 에 파일 쓰기 위해 필요.
+#   OPA/Gatekeeper 정책 구현 시 compliance-system 네임스페이스에
+#   non-root 예외 또는 falco-watchdog 전용 Constraint 제외 필요.
+# =============================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-watchdog-script
+  namespace: compliance-system
+  labels:
+    app: falco-watchdog
+    app.kubernetes.io/part-of: compliance-platform
+data:
+  watchdog.py: |
+    #!/usr/bin/env python3
+    """
+    Falco Watchdog — heartbeat canary + response server notification.
+
+    매 WATCHDOG_INTERVAL 초마다:
+      1. subprocess.run(["touch", HEARTBEAT_FILE])
+         → proc.name=touch 로 Falco Heartbeat Canary 룰 트리거
+      2. /proc 스캔으로 Falco 프로세스 생존 확인 (hostPID=true 필요)
+      3. POST /api/v1/heartbeat 로 Response Server에 상태 전달
+    """
+    import json
+    import logging
+    import os
+    import subprocess
+    import time
+    import urllib.error
+    import urllib.request
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] falco-watchdog: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    log = logging.getLogger("watchdog")
+
+    INTERVAL = int(os.getenv("WATCHDOG_INTERVAL", "30"))
+    HEARTBEAT_FILE = os.getenv("HEARTBEAT_FILE", "/var/run/falco-heartbeat")
+    RESPONSE_SERVER_URL = os.getenv(
+        "RESPONSE_SERVER_URL",
+        "http://response-server.compliance-system.svc.cluster.local:5000/api/v1/heartbeat",
+    )
+
+
+    def touch_heartbeat_file() -> bool:
+        """
+        touch 명령으로 heartbeat 파일 갱신.
+        proc.name=touch 이므로 values.yaml Falco Heartbeat Canary 룰과 매칭.
+        """
+        try:
+            result = subprocess.run(
+                ["touch", HEARTBEAT_FILE],
+                capture_output=True,
+                timeout=5,
+            )
+            return result.returncode == 0
+        except Exception as e:
+            log.warning("touch %s failed: %s", HEARTBEAT_FILE, e)
+            return False
+
+
+    def get_falco_status() -> str:
+        """
+        /proc 스캔으로 Falco 프로세스 생존 여부 확인.
+        hostPID=true 환경에서 호스트 프로세스 전체가 보임.
+        /proc/PID/comm 은 최대 15자로 잘릴 수 있어 startswith 사용.
+        """
+        try:
+            for pid in os.listdir("/proc"):
+                if not pid.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{pid}/comm") as f:
+                        comm = f.read().strip()
+                    # "falco", "falco-modern-bp" 등 모두 커버
+                    if comm.startswith("falco"):
+                        return "running"
+                except (OSError, IOError):
+                    continue
+        except Exception as e:
+            log.warning("Failed to scan /proc: %s", e)
+        return "stopped"
+
+
+    def send_heartbeat(falco_status: str) -> bool:
+        """Response Server /api/v1/heartbeat 에 상태 전송."""
+        payload = json.dumps({
+            "falco_status": falco_status,
+            "source": "falco-watchdog-daemonset",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            RESPONSE_SERVER_URL,
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                log.debug("Heartbeat sent: http=%d falco=%s", resp.status, falco_status)
+                return True
+        except urllib.error.URLError as e:
+            log.warning("Heartbeat send failed: %s", e.reason)
+        except Exception as e:
+            log.warning("Heartbeat send failed: %s", e)
+        return False
+
+
+    def main():
+        log.info(
+            "Falco Watchdog started (interval=%ds, file=%s)",
+            INTERVAL, HEARTBEAT_FILE,
+        )
+        log.info("Response server: %s", RESPONSE_SERVER_URL)
+
+        while True:
+            touched = touch_heartbeat_file()
+            falco_status = get_falco_status()
+            sent = send_heartbeat(falco_status)
+
+            log.info(
+                "tick: falco=%s touch=%s heartbeat_sent=%s",
+                falco_status, touched, sent,
+            )
+
+            if falco_status == "stopped":
+                log.critical(
+                    "FALCO PROCESS NOT FOUND — Falco may be down or killed!"
+                )
+
+            time.sleep(INTERVAL)
+
+
+    if __name__ == "__main__":
+        main()
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: falco-watchdog
+  namespace: compliance-system
+  labels:
+    app: falco-watchdog
+    app.kubernetes.io/part-of: compliance-platform
+spec:
+  selector:
+    matchLabels:
+      app: falco-watchdog
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: falco-watchdog
+        app.kubernetes.io/part-of: compliance-platform
+    spec:
+      # 호스트 프로세스 목록 접근 (/proc 스캔으로 Falco PID 확인)
+      hostPID: true
+      # kube-system 등 taint 노드에도 배포
+      tolerations:
+        - effect: NoSchedule
+          operator: Exists
+        - effect: NoExecute
+          operator: Exists
+      containers:
+        - name: falco-watchdog
+          image: python:3.12-slim
+          command: ["python3", "/scripts/watchdog.py"]
+          env:
+            - name: WATCHDOG_INTERVAL
+              value: "30"
+            # 컨테이너 내부에서 hostPath 마운트 경로와 일치
+            - name: HEARTBEAT_FILE
+              value: "/var/run/falco-heartbeat"
+            - name: RESPONSE_SERVER_URL
+              value: "http://response-server.compliance-system.svc.cluster.local:5000/api/v1/heartbeat"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          volumeMounts:
+            # 호스트 /var/run 을 컨테이너에 마운트
+            # touch /var/run/falco-heartbeat 가 호스트 파일시스템에 반영됨
+            - name: host-run
+              mountPath: /var/run
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            # 호스트 /var/run (root:root, drwxr-xr-x) 에 파일 쓰기 위해 root 필요
+            # OPA/Gatekeeper 구현 시 compliance-system 네임스페이스 예외 처리 필요
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: host-run
+          hostPath:
+            path: /var/run
+            type: Directory
+        - name: scripts
+          configMap:
+            name: falco-watchdog-script
+            defaultMode: 0555

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Windows Zone.Identifier (다운로드 메타데이터 — ADS, 유니코드 콜론 변형 포함)
+*:Zone.Identifier
+*Zone.Identifier
+
+# 문서
+*.docx
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code 내부
+.claude/

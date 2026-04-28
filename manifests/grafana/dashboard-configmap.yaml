@@ -1,0 +1,19 @@
+# Grafana Dashboard Provisioning ConfigMap
+# Apply this to auto-load the runtime detection dashboard into Grafana.
+#
+# If using kube-prometheus-stack Helm chart:
+#   - Add label grafana_dashboard: "1" for auto-discovery
+#   - Or mount via sidecar configmap
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-runtime-detection
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/part-of: compliance-platform
+data:
+  runtime-dashboard.json: |-
+    # Paste contents of runtime-dashboard.json here
+    # Or mount the file directly via volume

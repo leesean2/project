@@ -1,0 +1,64 @@
+# =============================================================
+# Test Resources — Attack Simulation for Demo
+# =============================================================
+# Intentionally insecure pods for demonstrating runtime detection
+# =============================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-workloads
+  labels:
+    purpose: compliance-testing
+
+---
+# Vulnerable Pod 1: Basic container for shell/file access tests
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vulnerable-app
+  namespace: test-workloads
+  labels:
+    app: vulnerable-app
+    tier: test
+spec:
+  containers:
+    - name: app
+      image: ubuntu:22.04
+      command: ["sleep", "infinity"]
+      securityContext:
+        runAsUser: 1000
+        runAsNonRoot: true
+
+---
+# Vulnerable Pod 2: Network-capable container for outbound tests
+apiVersion: v1
+kind: Pod
+metadata:
+  name: network-test
+  namespace: test-workloads
+  labels:
+    app: network-test
+    tier: test
+spec:
+  containers:
+    - name: app
+      image: curlimages/curl:latest
+      command: ["sleep", "infinity"]
+
+---
+# Vulnerable Pod 3: Alpine with tools for recon simulation
+apiVersion: v1
+kind: Pod
+metadata:
+  name: recon-target
+  namespace: test-workloads
+  labels:
+    app: recon-target
+    tier: test
+spec:
+  containers:
+    - name: app
+      image: alpine:3.19
+      command: ["sleep", "infinity"]
