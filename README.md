@@ -84,8 +84,10 @@ Policy-as-code-Complience/
 │   └── compliance-rules.yaml         # 컴플라이언스 룰 6개 + 자체 보호 룰 5개
 ├── manifests/
 │   ├── response-server.yaml          # NS + RBAC + Deployment + Service
+│   ├── signing-proxy.yaml            # HMAC Signing Proxy — Sidekick → Response Server
+│   ├── falco-watchdog.yaml           # Heartbeat Watchdog DaemonSet (신규)
 │   ├── test-workloads.yaml           # 테스트용 취약 Pod들
-│   ├── prometheus-integration.yaml
+│   ├── prometheus-integration.yaml   # Prometheus scrape config + ServiceMonitor
 │   └── grafana/
 │       ├── runtime-dashboard.json
 │       └── dashboard-configmap.yaml
@@ -109,14 +111,22 @@ Policy-as-code-Complience/
 
 ### 컴플라이언스 탐지 룰 (container.id != host)
 
-| # | Rule | Priority | ISMS-P / PCI-DSS | 탐지 대상 |
-|---|------|----------|-----------------|----------|
-| 1 | Read Sensitive File | WARNING | ISMS-P 2.6.1, PCI-DSS 7.1 | /etc/shadow, SSH 키, kubeconfig |
-| 2 | Shell Spawned | WARNING | ISMS-P 2.6.1 | 컨테이너 내 interactive shell exec |
-| 3 | Unexpected Outbound | NOTICE | ISMS-P 2.6.7, PCI-DSS 1.3 | 외부 IP 연결 (C2 통신) |
-| 4 | Container Reconnaissance | NOTICE | ISMS-P 2.11.4 | whoami, nmap, /proc 스캔 |
-| 5 | Privilege Escalation | CRITICAL | ISMS-P 2.6.1, PCI-DSS 7.1 | setuid/setgid to root |
-| 6 | Write Monitored Directory | ERROR | ISMS-P 2.11.1 | /bin, /usr/bin 등 변조 |
+모든 룰에 `evt.dir = <` 조건 적용 — syscall 진입이 아닌 반환(완료) 시점에만 발화해 이중 발화 방지.
+
+| # | Rule | Priority | ISMS-P / PCI-DSS | 탐지 대상 | 주요 조건 |
+|---|------|----------|-----------------|----------|----------|
+| 1 | Read Sensitive File | WARNING | ISMS-P 2.6.1, PCI-DSS 7.1 | /etc/shadow, SSH 키, kubeconfig | `evt.dir = <` |
+| 2 | Shell Spawned | WARNING | ISMS-P 2.6.1 | 컨테이너 내 interactive shell exec | `evt.dir = <`, `proc.tty != 0` |
+| 3 | Unexpected Outbound | NOTICE | ISMS-P 2.6.7, PCI-DSS 1.3 | 외부 IP 연결 (C2 통신) | `evt.dir = <`, CIDR 사설대역 제외, `falcoctl` 제외 |
+| 4 | Container Reconnaissance | NOTICE | ISMS-P 2.11.4 | whoami, nmap, /proc 스캔 | `evt.dir = <` |
+| 5 | Privilege Escalation | CRITICAL | ISMS-P 2.6.1, PCI-DSS 7.1 | setuid/setgid to root | `evt.dir = <`, `evt.arg.uid = 0 or evt.arg.euid = 0` |
+| 6 | Write Monitored Directory | ERROR | ISMS-P 2.11.1 | /bin, /usr/bin 등 변조 | `evt.dir = <`, `O_WRONLY or O_RDWR` 플래그 검사 |
+
+**Rule 3 사설 IP 필터**: K8s 클러스터 내부 통신(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8)을 제외해 오탐 방지.
+
+**Rule 5 강화**: `user.uid != 0` 만으로는 부족 — `evt.arg.uid = 0 or evt.arg.euid = 0` 조건으로 실제 root 권한 획득 시도만 탐지.
+
+**Rule 6 강화**: 읽기 전용 오픈은 제외, `O_WRONLY` / `O_RDWR` 플래그가 있는 쓰기 시도만 탐지.
 
 ### Falco 자체 보호 룰 (container.id = host)
 
@@ -126,9 +136,11 @@ Policy-as-code-Complience/
 | 8 | Falco Tamper - Rules File Write | CRITICAL | /etc/falco/ 설정 변조 | `proc.pname not in (apt/ansible/helm)` + `loginuid != 4294967295` |
 | 9 | Falco Tamper - Remove Immutability | CRITICAL | `chattr -i /usr/bin/falco` | — |
 | 10 | Falco Tamper - Stop or Disable Service | CRITICAL | `systemctl stop/disable falco` | — |
-| 11 | Falco Heartbeat Canary | NOTICE | /var/run/falco-heartbeat touch | `proc.pname in (falco-watchdog, systemd, cron)` |
+| 11 | Falco Heartbeat Canary | NOTICE | /var/run/falco-heartbeat touch | `container.id = host or container.name = "falco-watchdog"` |
 
 > **룰 레벨 오탐 완화**: Tamper 룰에 `proc.pname`(부모 프로세스) 조건과 `user.loginuid = 4294967295` 제외 조건을 추가해 패키지 업그레이드/배포 자동화로 인한 오탐을 1차 차단.
+
+> **Heartbeat Canary 이중 경로**: `container.id = host` (호스트 systemd 서비스) 와 `container.name = "falco-watchdog"` (K8s DaemonSet) 을 모두 허용.
 
 ---
 
@@ -209,9 +221,29 @@ Falco 바이너리, 룰 파일, 설정 파일에 `chattr +i`(immutable 플래그
 
 ### Heartbeat Watchdog
 
-`falco-watchdog` systemd 서비스가 30초마다:
-1. `/var/run/falco-heartbeat` 파일 touch → Falco Heartbeat Canary 룰 발화
-2. `POST /api/v1/heartbeat` → Response Server에 Falco 프로세스 생존 상태 보고
+`falco-watchdog` **K8s DaemonSet** (`manifests/falco-watchdog.yaml`) 이 30초마다 두 경로로 Falco 생존을 검증한다.
+
+**경로 1 — Falco 파이프라인 전체 테스트 (Canary)**:
+
+```
+subprocess touch /var/run/falco-heartbeat (proc.name=touch)
+  → Falco Heartbeat Canary 룰 발화
+  → Sidekick → signing-proxy → Response Server /webhook
+```
+
+**경로 2 — Falco 프로세스 직접 확인**:
+
+```
+/proc 스캔 (hostPID=true) → Falco 프로세스 생존 확인
+  → POST /api/v1/heartbeat {"falco_status": "running"|"stopped"}
+  → HeartbeatMonitor.record_watchdog() 갱신
+```
+
+DaemonSet 배포:
+
+```bash
+kubectl apply -f manifests/falco-watchdog.yaml
+```
 
 HeartbeatMonitor가 백그라운드에서 주기적으로 감시:
 
@@ -220,6 +252,8 @@ HeartbeatMonitor가 백그라운드에서 주기적으로 감시:
 | 이벤트 스트림 `HEARTBEAT_SILENCE_THRESHOLD`(기본 90s) 초과 | CRITICAL 로그 + `compliance_falco_silence_total` 증가 |
 | Watchdog heartbeat `threshold × 2` 초과 | CRITICAL 로그 (watchdog 서비스 장애 의심) |
 | Watchdog에서 `falco_status=stopped` 수신 | 즉시 CRITICAL |
+
+> **OPA/Gatekeeper 구현 시 주의**: falco-watchdog 은 호스트 `/var/run` 에 쓰기 위해 `runAsUser: 0` 으로 실행된다. Gatekeeper non-root 정책 적용 시 `compliance-system` 네임스페이스 또는 `falco-watchdog` Pod에 예외 Constraint 추가 필요.
 
 ---
 
@@ -293,7 +327,7 @@ Authorization: Bearer <API_TOKEN>
 X-Watchdog-Token: <HEARTBEAT_TOKEN>
 ```
 
-`HEARTBEAT_TOKEN` 미설정 시 503, 토큰 불일치 시 401. `falco-watchdog` systemd 서비스에서만 호출.
+`HEARTBEAT_TOKEN` 미설정 시 503, 토큰 불일치 시 401. `falco-watchdog` DaemonSet에서만 호출.
 
 **CORS** — 와일드카드 금지, 환경변수 화이트리스트 (`[HIGH #6]`)
 
@@ -362,12 +396,15 @@ X-Watchdog-Token: <HEARTBEAT_TOKEN>
 
 # 단계별 배포
 ./scripts/01-setup-cluster.sh          # kind 클러스터 생성
-./scripts/02-deploy-falco.sh           # Falco + Sidekick Helm 배포
+./scripts/02-deploy-falco.sh           # Falco + Sidekick Helm 배포 (modern_ebpf, driver.enabled=true)
 ./scripts/03-deploy-response-server.sh # Docker build + K8s 배포
 
 # Falco 보호 강화 (권장)
-./scripts/07-harden-falco.sh           # chattr +i + heartbeat watchdog
+./scripts/07-harden-falco.sh           # chattr +i 변조 방지
 ./scripts/08-setup-signing-proxy.sh    # HMAC Signing Proxy 설치
+
+# Heartbeat Watchdog 배포 (Falco 침묵 탐지)
+kubectl apply -f manifests/falco-watchdog.yaml
 
 # 검증
 ./scripts/04-run-tests.sh              # 공격 시뮬레이션
@@ -378,6 +415,7 @@ kubectl port-forward -n compliance-system svc/response-server 5000:5000
 curl localhost:5000/api/v1/events/summary
 curl localhost:5000/metrics
 curl localhost:5000/api/v1/events?severity=high
+curl localhost:5000/api/v1/falco/status   # Falco 생존 상태 확인
 ```
 
 ---
@@ -409,9 +447,42 @@ python3 tests/test_integration.py
 |-----------|-----------|-------------|
 | Falco → Signing Proxy | HTTP POST (localhost) | Falco http_output |
 | Signing Proxy → Response Server | HTTP POST + HMAC 헤더 | 서명된 이벤트 전달 |
-| Response Server → AI Module | HTTP POST (`AI_ENDPOINT`) | 위협 분류 (이온 담당) |
+| Response Server → AI Module | HTTP POST (`AI_ENDPOINT`) | 위협 분류 (C 파트 담당) |
 | Response Server → K8s API | HTTPS | NetworkPolicy CRUD + pod 메타 조회 |
 | Response Server → Prometheus | HTTP GET `/metrics` | 메트릭 스크래핑 |
-| Prometheus → Grafana | PromQL | 대시보드 시각화 (이온 담당) |
+| Prometheus → Grafana | PromQL | 대시보드 시각화 (C 파트 담당) |
 | Response Server → Dashboard | HTTP GET `/api/v1/*` | 이벤트 조회 API |
-| Watchdog → Response Server | HTTP POST `/api/v1/heartbeat` | Falco 생존 신호 |
+| Watchdog DaemonSet → Response Server | HTTP POST `/api/v1/heartbeat` | Falco 생존 신호 (30s 주기) |
+| Watchdog DaemonSet → Falco (via file) | touch `/var/run/falco-heartbeat` | Canary 룰 트리거 — 파이프라인 전체 테스트 |
+
+---
+
+## Changelog
+
+### 2026-04-28
+
+#### 버그 수정
+
+| 파일 | 수정 내용 |
+|------|----------|
+| `falco/values.yaml` | `driver.enabled: false → true` — 비활성화 상태로 커밋돼 있어 Falco가 시스콜을 전혀 수집하지 못하던 문제 수정 |
+| `falco/values.yaml` | `load_plugins: ["k8s-audit", "json"] → []` — 두 플러그인 모두 별도 설치 필요. 없으면 Falco 기동 실패 |
+| `falco/values.yaml` | Rule 3 (Outbound Connection) exclusion에 `falcoctl` 추가 — falcoctl 정상 통신이 오탐으로 잡히던 문제 수정 |
+| `manifests/prometheus-integration.yaml` | ServiceMonitor `port: metrics → http` — Service 포트 이름(`http`)과 불일치로 Prometheus 스크레이핑 실패하던 문제 수정 |
+| `manifests/prometheus-integration.yaml` | relabel_config 주소 구성 버그 수정 — 어노테이션 포트만 `__address__`에 쓰던 문제를 `pod_ip:port` 조합으로 수정; 폴백 포트 `8080 → 5000` |
+
+#### Falco 룰 강화 (`falco/compliance-rules.yaml` — `values.yaml` 동기화)
+
+| 룰 | 변경 내용 |
+|----|----------|
+| Rules 1~6 전체 | `evt.dir = <` 추가 — syscall 반환(완료) 시점에만 발화, 이중 발화 방지 |
+| Rule 3 (Outbound Connection) | `fd.ip != "0.0.0.0"` → CIDR 사설대역 필터 (10/8, 172.16/12, 192.168/16, 127/8 제외) + `falcoctl` 추가 |
+| Rule 5 (Privilege Escalation) | `evt.arg.uid = 0 or evt.arg.euid = 0` 조건 추가 — 실제 root 권한 획득 시도만 탐지 |
+| Rule 6 (Write Monitored Dir) | `O_WRONLY or O_RDWR` 플래그 검사 추가 — 읽기 전용 오픈 오탐 제거 |
+| Heartbeat Canary | `container.id = host` → `(container.id = host or container.name = "falco-watchdog")` + `proc.name`에 `python3` 추가 |
+
+#### 신규 추가
+
+| 파일 | 내용 |
+|------|------|
+| `manifests/falco-watchdog.yaml` | Falco Heartbeat Watchdog K8s DaemonSet 신규 구현. 30초 주기로 Canary 파일 touch + /proc 스캔 + Response Server HTTP heartbeat 전송. 기존 README에 언급만 있고 구현체가 없었던 컴포넌트. |
