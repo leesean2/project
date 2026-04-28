@@ -1,0 +1,221 @@
+# =============================================================
+# Signing Proxy — K8s-native HMAC 서명 프록시
+# =============================================================
+# 목적: Falco Sidekick이 Response Server에 보내는 웹훅에
+#       HMAC-SHA256 서명 헤더를 자동으로 추가한다.
+#
+# 흐름:
+#   Falco Sidekick → signing-proxy:5001 → response-server:5000
+#
+# 서명 형식 (security.py/_verify_hmac 과 동일):
+#   X-Webhook-Signature : sha256=<HMAC-SHA256(secret, "{ts}.{body}")>
+#   X-Webhook-Timestamp : <Unix timestamp>
+#
+# 비밀키: webhook-secret Secret의 WEBHOOK_SECRET 키를 공유
+#         (response-server.yaml 과 동일한 Secret)
+# =============================================================
+
+---
+# signing-proxy 인라인 Python 스크립트
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: signing-proxy-script
+  namespace: compliance-system
+  labels:
+    app: signing-proxy
+    app.kubernetes.io/part-of: compliance-platform
+data:
+  proxy.py: |
+    #!/usr/bin/env python3
+    """
+    HMAC Signing Proxy — Falco Sidekick → Response Server
+    WEBHOOK_SECRET 환경변수로 서명 키를 주입한다.
+    """
+    import hashlib
+    import hmac as _hmac
+    import http.server
+    import logging
+    import os
+    import time
+    import urllib.request
+    import urllib.error
+
+    LISTEN_PORT = int(os.getenv("PROXY_PORT", "5001"))
+    TARGET_URL  = os.getenv("TARGET_URL",
+                            "http://response-server.compliance-system.svc.cluster.local:5000/webhook")
+    SECRET      = os.getenv("WEBHOOK_SECRET", "").encode("utf-8")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] signing-proxy: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    log = logging.getLogger("proxy")
+
+    MAX_BODY = 1 * 1024 * 1024  # 1 MB
+
+
+    class ProxyHandler(http.server.BaseHTTPRequestHandler):
+        """POST 요청을 받아 HMAC 서명 헤더를 추가한 뒤 TARGET_URL로 전달."""
+
+        def log_message(self, fmt, *args):
+            pass  # 기본 액세스 로그 억제
+
+        def do_POST(self):
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                if content_length > MAX_BODY:
+                    self._reply(413, b'{"error":"body too large"}')
+                    return
+
+                body = self.rfile.read(content_length) if content_length > 0 else b""
+
+                ts = str(int(time.time()))
+
+                fwd_headers = {
+                    "Content-Type": self.headers.get("Content-Type", "application/json"),
+                    "X-Webhook-Timestamp": ts,
+                }
+
+                if SECRET:
+                    signed_payload = ts.encode("utf-8") + b"." + body
+                    sig = _hmac.new(SECRET, signed_payload, hashlib.sha256).hexdigest()
+                    fwd_headers["X-Webhook-Signature"] = f"sha256={sig}"
+                    log.debug("Signed and forwarding %d bytes to %s", len(body), TARGET_URL)
+                else:
+                    # WEBHOOK_SECRET 미설정 시 경고 — soft mode fallback
+                    log.warning("WEBHOOK_SECRET not set; forwarding without HMAC signature")
+
+                req = urllib.request.Request(
+                    TARGET_URL, data=body, method="POST", headers=fwd_headers
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    resp_body = resp.read()
+                    self._reply(resp.status, resp_body)
+                    log.info("Forwarded → %d", resp.status)
+
+            except urllib.error.HTTPError as e:
+                err_body = e.read()
+                log.warning("Upstream HTTP error %d: %s", e.code, err_body[:200])
+                self._reply(e.code, err_body)
+            except Exception as exc:
+                log.error("Proxy error: %s", exc)
+                self._reply(502, b'{"error":"upstream error"}')
+
+        def _reply(self, status: int, body: bytes):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            """헬스체크 엔드포인트 /healthz"""
+            if self.path == "/healthz":
+                self._reply(200, b'{"status":"ok"}')
+            else:
+                self._reply(404, b'{"error":"not found"}')
+
+
+    if __name__ == "__main__":
+        if not SECRET:
+            log.warning("WEBHOOK_SECRET is empty — HMAC signing disabled (soft mode)")
+        log.info("Signing Proxy listening on :%d → %s", LISTEN_PORT, TARGET_URL)
+        server = http.server.HTTPServer(("0.0.0.0", LISTEN_PORT), ProxyHandler)
+        server.serve_forever()
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: signing-proxy
+  namespace: compliance-system
+  labels:
+    app: signing-proxy
+    app.kubernetes.io/part-of: compliance-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: signing-proxy
+  template:
+    metadata:
+      labels:
+        app: signing-proxy
+        app.kubernetes.io/part-of: compliance-platform
+    spec:
+      containers:
+        - name: signing-proxy
+          image: python:3.12-slim
+          command: ["python3", "/app/proxy.py"]
+          ports:
+            - name: proxy
+              containerPort: 5001
+              protocol: TCP
+          env:
+            - name: PROXY_PORT
+              value: "5001"
+            - name: TARGET_URL
+              value: "http://response-server.compliance-system.svc.cluster.local:5000/webhook"
+            # WEBHOOK_SECRET: response-server와 동일한 Secret에서 주입
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: webhook-secret
+                  key: WEBHOOK_SECRET
+                  # optional: true → Secret 없어도 Pod 시작 가능 (soft mode fallback)
+                  optional: true
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            initialDelaySeconds: 3
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: script
+          configMap:
+            name: signing-proxy-script
+            defaultMode: 0555
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: signing-proxy
+  namespace: compliance-system
+  labels:
+    app: signing-proxy
+    app.kubernetes.io/part-of: compliance-platform
+spec:
+  type: ClusterIP
+  selector:
+    app: signing-proxy
+  ports:
+    - name: proxy
+      port: 5001
+      targetPort: proxy
+      protocol: TCP
